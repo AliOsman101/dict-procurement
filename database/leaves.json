@@ -1,0 +1,16 @@
+[
+    {"leave_name": "Vacation Leave", "accrual_rate": 1.25, "expiration_days": null, "frequency": "monthly", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Sick Leave", "accrual_rate": 1.25, "expiration_days": null, "frequency": "monthly", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Maternity Leave", "accrual_rate": null, "expiration_days": 365, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Paternity Leave", "accrual_rate": null, "expiration_days": 365, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Mandatory/Forced Leave", "accrual_rate": 5.00, "expiration_days": 365, "frequency": "yearly", "fixed_expiry": "12-31", "notes": "Must be used within the year"},
+    {"leave_name": "Special Privilege Leave", "accrual_rate": 3.00, "expiration_days": 365, "frequency": "yearly", "fixed_expiry": "12-31", "notes": "Must be used within the year"},
+    {"leave_name": "Solo Parent Leave", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Study Leave", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "10-Day VAWC Leave", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Rehabilitation Privilege", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Special Leave Benefits for Women", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Special Emergency (Calamity) Leave", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Adoption Leave", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null},
+    {"leave_name": "Compensatory Time Off (CTO)", "accrual_rate": null, "expiration_days": null, "frequency": "event_based", "fixed_expiry": null, "notes": null}
+]

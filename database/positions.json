@@ -1,0 +1,234 @@
+[
+    {
+        "id": 1,
+        "name": "ACCOUNTANT I"
+    },
+    {
+        "id": 2,
+        "name": "ACCOUNTANT II"
+    },
+    {
+        "id": 3,
+        "name": "ACCOUNTANT III"
+    },
+    {
+        "id": 4,
+        "name": "ADMIN ACCOUNT I"
+    },
+    {
+        "id": 5,
+        "name": "ADMIN AIDE  I"
+    },
+    {
+        "id": 6,
+        "name": "ADMIN AIDE II"
+    },
+    {
+        "id": 7,
+        "name": "ADMIN AIDE III"
+    },
+    {
+        "id": 8,
+        "name": "ADMIN AIDE IV"
+    },
+    {
+        "id": 9,
+        "name": "ADMIN ASSISTANT I"
+    },
+    {
+        "id": 10,
+        "name": "ADMIN ASSISTANT II"
+    },
+    {
+        "id": 11,
+        "name": "ADMIN OFFICER I"
+    },
+    {
+        "id": 12,
+        "name": "ADMIN OFFICER II"
+    },
+    {
+        "id": 13,
+        "name": "ADMIN OFFICER III"
+    },
+    {
+        "id": 14,
+        "name": "ADMIN OFFICER IV"
+    },
+    {
+        "id": 15,
+        "name": "CAO"
+    },
+    {
+        "id": 16,
+        "name": "CEO I"
+    },
+    {
+        "id": 17,
+        "name": "CEO II"
+    },
+    {
+        "id": 18,
+        "name": "CEO III"
+    },
+    {
+        "id": 19,
+        "name": "COMPUTER MAINTENANCE I"
+    },
+    {
+        "id": 20,
+        "name": "DICT - EBIZ"
+    },
+    {
+        "id": 21,
+        "name": "DIRECTOR I"
+    },
+    {
+        "id": 22,
+        "name": "DIRECTOR II"
+    },
+    {
+        "id": 23,
+        "name": "DIRECTOR III"
+    },
+    {
+        "id": 24,
+        "name": "DIRECTOR IV"
+    },
+    {
+        "id": 25,
+        "name": "DIRECTOR V"
+    },
+    {
+        "id": 26,
+        "name": "DIRECTOR VI"
+    },
+    {
+        "id": 27,
+        "name": "DRIVER"
+    },
+    {
+        "id": 28,
+        "name": "ECET I"
+    },
+    {
+        "id": 29,
+        "name": "ECET II"
+    },
+    {
+        "id": 30,
+        "name": "ECET III"
+    },
+    {
+        "id": 31,
+        "name": "ENGINEER I"
+    },
+    {
+        "id": 32,
+        "name": "ENGINEER II"
+    },
+    {
+        "id": 33,
+        "name": "ENGINEER III"
+    },
+    {
+        "id": 34,
+        "name": "ERROR (NOT IN LIST)"
+    },
+    {
+        "id": 35,
+        "name": "HUMAN RESOURCE MANAGEMENT OFFICER II"
+    },
+    {
+        "id": 36,
+        "name": "ISA I"
+    },
+    {
+        "id": 37,
+        "name": "ISA II"
+    },
+    {
+        "id": 38,
+        "name": "ISR I"
+    },
+    {
+        "id": 39,
+        "name": "ISR II"
+    },
+    {
+        "id": 40,
+        "name": "ISR III"
+    },
+    {
+        "id": 41,
+        "name": "ITO I"
+    },
+    {
+        "id": 42,
+        "name": "ITO II"
+    },
+    {
+        "id": 43,
+        "name": "ITO III"
+    },
+    {
+        "id": 44,
+        "name": "LINEMAN I"
+    },
+    {
+        "id": 45,
+        "name": "LINEMAN II"
+    },
+    {
+        "id": 46,
+        "name": "MPO I"
+    },
+    {
+        "id": 47,
+        "name": "MPO II"
+    },
+    {
+        "id": 48,
+        "name": "PDO I"
+    },
+    {
+        "id": 49,
+        "name": "PDO II"
+    },
+    {
+        "id": 50,
+        "name": "PLO I"
+    },
+    {
+        "id": 51,
+        "name": "PLO II"
+    },
+    {
+        "id": 52,
+        "name": "PMO I"
+    },
+    {
+        "id": 53,
+        "name": "SAO"
+    },
+    {
+        "id": 54,
+        "name": "TELEGRAM CARRIER"
+    },
+    {
+        "id": 55,
+        "name": "TRAINING SPECIALIST I"
+    },
+    {
+        "id": 56,
+        "name": "TRAINING SPECIALIST II"
+    },
+    {
+        "id": 57,
+        "name": "TRAINING SPECIALIST III"
+    },
+    {
+        "id": 58,
+        "name": "TRAINING SPECIALIST IV"
+    }
+]
