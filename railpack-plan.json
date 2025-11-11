@@ -1,23 +1,33 @@
 {
-  "php": {
-    "version": "8.2",
-    "extensions": [
-      "intl",
-      "zip",
-      "gd",
-      "ctype",
-      "curl",
-      "dom",
-      "fileinfo",
-      "filter",
-      "hash",
-      "mbstring",
-      "openssl",
-      "pcre",
-      "pdo",
-      "session",
-      "tokenizer",
-      "xml"
-    ]
-  }
+  "php": "8.2",
+  "extensions": [
+    "ctype",
+    "curl",
+    "dom",
+    "fileinfo",
+    "filter",
+    "hash",
+    "intl",
+    "mbstring",
+    "openssl",
+    "pcre",
+    "pdo",
+    "pdo_mysql",
+    "session",
+    "tokenizer",
+    "xml",
+    "zip",
+    "gd"
+  ],
+  "node": "22",
+  "composer": true,
+  "build": [
+    "npm ci",
+    "npm prune --omit=dev --ignore-scripts",
+    "mkdir -p storage/framework/{sessions,views,cache,testing} storage/logs bootstrap/cache && chmod -R a+rw storage",
+    "php artisan config:cache",
+    "php artisan route:cache",
+    "php artisan view:cache"
+  ],
+  "start": "php artisan serve --host=0.0.0.0 --port=$PORT"
 }
