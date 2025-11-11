@@ -21,7 +21,13 @@
   ],
   "node": "22",
   "composer": true,
+  "apt": [
+    "libzip-dev",
+    "libpng-dev",
+    "libicu-dev"
+  ],
   "build": [
+    "docker-php-ext-install intl zip gd",
     "npm ci",
     "npm prune --omit=dev --ignore-scripts",
     "composer install --optimize-autoloader --no-scripts --no-interaction",
