@@ -1,6 +1,23 @@
 {
   "php": {
     "version": "8.2",
-    "extensions": ["intl", "zip", "gd", "ctype", "curl", "dom", "fileinfo", "filter", "hash", "mbstring", "openssl", "pcre", "pdo", "session", "tokenizer", "xml"]
+    "extensions": [
+      "intl",
+      "zip",
+      "gd",
+      "ctype",
+      "curl",
+      "dom",
+      "fileinfo",
+      "filter",
+      "hash",
+      "mbstring",
+      "openssl",
+      "pcre",
+      "pdo",
+      "session",
+      "tokenizer",
+      "xml"
+    ]
   }
 }
