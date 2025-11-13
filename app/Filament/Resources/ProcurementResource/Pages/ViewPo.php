@@ -171,7 +171,7 @@ class ViewPo extends ViewRecord
                             }),
                         TextEntry::make('procurement_type')
                             ->badge()
-                            ->color(fn (string $state) => $state === 'small_value_procurement' ? 'info' : 'primary')
+                            ->color(fn ($state) => $state === 'small_value_procurement' ? 'info' : 'primary')
                             ->formatStateUsing(fn ($state) => ucwords(str_replace('_', ' ', $state))),
                         TextEntry::make('fundCluster.name')
                             ->label('Fund Cluster'),
@@ -280,130 +280,132 @@ class ViewPo extends ViewRecord
     }
 
     protected function getHeaderActions(): array
-    {
-        $user = auth()->user();
-        $hasBacApproved = $this->hasBacApproved();
-        $isLocked = $this->record->status === 'Locked';
-        
-        // Check if user can edit
-        $canEdit = $user && $user->can('update', $this->record);
+        {
+            $user = auth()->user();
+            $hasBacApproved = $this->hasBacApproved();
+            $isLocked = $this->record->status === 'Locked';
+            
+            // Check if user can edit
+            $canEdit = $user && $user->can('update', $this->record);
 
-        // View PDF action (visible to everyone, but disabled if no BAC approved)
-        $viewPdf = Actions\Action::make('viewPdf')
-            ->label('View PDF')
-            ->icon('heroicon-o-document-text')
-            ->url(fn () => route('procurements.po.pdf', $this->record->id), true)
-            ->color('info')
-            ->disabled(fn () => !$hasBacApproved)
-            ->tooltip(fn () => !$hasBacApproved ? 'BAC Resolution must be approved first' : null);
+            // View PDF action (visible to everyone, but disabled if no BAC approved)
+            $viewPdf = Actions\Action::make('viewPdf')
+                ->label('View PDF')
+                ->icon('heroicon-o-document-text')
+                ->url(fn () => route('procurements.po.pdf', $this->record->id), true)
+                ->color('info')
+                ->disabled(fn () => !$hasBacApproved)
+                ->tooltip(fn () => !$hasBacApproved ? 'BAC Resolution must be approved first' : null);
 
-        // Set PO Details Modal
-        $setPoDetails = Actions\Action::make('setPoDetails')
-            ->label('Set PO Details')
-            ->icon('heroicon-o-pencil-square')
-            ->color(fn () => $hasBacApproved && $canEdit && !$isLocked ? 'primary' : 'gray')
-            ->disabled(fn () => !$hasBacApproved || !$canEdit || $isLocked)
-            ->tooltip(function () use ($hasBacApproved, $canEdit, $isLocked) {
-                if (!$hasBacApproved) return 'BAC Resolution must be approved first';
-                if (!$canEdit) return 'You do not have permission to edit';
-                if ($isLocked) return 'PO is locked';
-                return null;
-            })
-            ->visible(fn () => !$isLocked)
-            ->fillForm(fn ($record) => $record->only([
-                'place_of_delivery',
-                'date_of_delivery',
-                'payment_term',
-                'ors_burs_no',
-                'ors_burs_date',
-            ]))
-            ->form([
-                Forms\Components\TextInput::make('place_of_delivery')
-                    ->label('Place of Delivery')
-                    ->default('DICT CAR, Baguio City')
-                    ->required(),
-                Forms\Components\DatePicker::make('date_of_delivery')
-                    ->label('Date of Delivery')
-                    ->minDate(now()->addDay())
-                    ->required(),
-                Forms\Components\Textarea::make('payment_term')
-                    ->label('Payment Term')
-                    ->default('within 5 working days upon Inspection and Acceptance')
-                    ->required(),
-                Forms\Components\TextInput::make('ors_burs_no')
-                    ->label('ORS/BURS No.'),
-                Forms\Components\DatePicker::make('ors_burs_date')
-                    ->label('Date of ORS/BURS')
-                    ->maxDate(now())
-                    ->required(),
-            ])
-            ->action(function (array $data, Procurement $record) {
-                $record->update($data);
-                $this->record->refresh();
+            // BAC Warning Modal - Show as a mounted action if no BAC approved
+            if (!$hasBacApproved) {
+                $bacWarning = Actions\Action::make('bacWarning')
+                    ->label('')
+                    ->modalHeading('BAC Resolution Required')
+                    ->modalDescription('The BAC Resolution Recommending Award must be approved first before you can manage this Purchase Order.')
+                    ->modalSubmitAction(false)
+                    ->modalCancelActionLabel('Go to BAC Resolution')
+                    ->modalIcon('heroicon-o-exclamation-triangle')
+                    ->modalIconColor('danger')
+                    ->color('danger')
+                    ->extraModalFooterActions([
+                        Actions\Action::make('goToBac')
+                            ->label('Go to BAC Resolution')
+                            ->url(route('filament.admin.resources.procurements.view-bac', $this->record->parent_id))
+                            ->color('primary')
+                            ->button(),
+                    ])
+                    ->modalCancelAction(false)
+                    ->closeModalByClickingAway(false)
+                    ->extraAttributes(['style' => 'display: none;']);
 
-                \App\Helpers\ActivityLogger::log(
-        'Set PO Details',
-        'PO details for ' . $record->procurement_id . ' were set by ' . \Illuminate\Support\Facades\Auth::user()->name
-    );
+                return [$bacWarning, $viewPdf];
+            }
 
-                Notification::make()
-                    ->title('PO Details updated successfully')
-                    ->success()
-                    ->send();
-            })
-            ->modalSubmitAction(fn ($action) => $action->label('Save Changes')->color('primary'));
-
-        $lock = Actions\Action::make('lock')
-            ->label('Lock')
-            ->icon('heroicon-o-lock-closed')
-            ->color(fn () => $hasBacApproved && $canEdit ? 'danger' : 'gray')
-            ->disabled(fn () => !$hasBacApproved || !$canEdit)
-            ->tooltip(function () use ($hasBacApproved, $canEdit) {
-                if (!$hasBacApproved) return 'BAC Resolution must be approved first';
-                if (!$canEdit) return 'You do not have permission to lock';
-                return null;
-            })
-            ->requiresConfirmation()
-            ->action(function () {
-                $this->record->update(['status' => 'Locked']);
-  // ✅ Log the action
-    \App\Helpers\ActivityLogger::log(
-        'Locked Purchase Order',
-        'Purchase Order ' . $this->record->procurement_id . ' was locked by ' . \Illuminate\Support\Facades\Auth::user()->name
-    );
-
-                Notification::make()->title('PO locked')->success()->send();
-            })
-            ->visible(fn () => !$isLocked)
-            ->modalSubmitAction(fn ($action) => $action->label('Lock PO')->color('danger'));
-
-        // BAC Warning Modal - Show as a mounted action if no BAC approved
-        if (!$hasBacApproved) {
-            $bacWarning = Actions\Action::make('bacWarning')
-                ->label('')
-                ->modalHeading('⚠️ BAC Resolution Required')
-                ->modalDescription('The BAC Resolution Recommending Award must be approved first before you can manage this Purchase Order.')
-                ->modalSubmitAction(false)
-                ->modalCancelActionLabel('Go to BAC Resolution')
-                ->modalIcon('heroicon-o-exclamation-triangle')
-                ->modalIconColor('danger')
-                ->color('danger')
-                ->extraModalFooterActions([
-                    Actions\Action::make('goToBac')
-                        ->label('Go to BAC Resolution')
-                        ->url(route('filament.admin.resources.procurements.view-bac', $this->record->parent_id))
-                        ->color('primary')
-                        ->button(),
+            // Set PO Details Modal — HIDDEN when locked OR fully approved
+            $setPoDetails = Actions\Action::make('setPoDetails')
+                ->label('Set PO Details')
+                ->icon('heroicon-o-pencil-square')
+                ->color(fn () => $canEdit && !$isLocked && !$this->isFullyApproved() ? 'primary' : 'gray')
+                ->disabled(fn () => !$canEdit || $isLocked || $this->isFullyApproved())
+                ->tooltip(fn () => 
+                    !$canEdit ? 'You do not have permission to edit' : 
+                    ($isLocked ? 'PO is locked' : 
+                    ($this->isFullyApproved() ? 'PO is fully approved' : null))
+                )
+                ->visible(fn () => !$isLocked && !$this->isFullyApproved())  // FIXED: Hide on approval
+                ->fillForm(fn ($record) => $record->only([
+                    'place_of_delivery',
+                    'date_of_delivery',
+                    'payment_term',
+                    'ors_burs_no',
+                    'ors_burs_date',
+                ]))
+                ->form([
+                    Forms\Components\TextInput::make('place_of_delivery')
+                        ->label('Place of Delivery')
+                        ->default('DICT CAR, Baguio City')
+                        ->required(),
+                    Forms\Components\DatePicker::make('date_of_delivery')
+                        ->label('Date of Delivery')
+                        ->minDate(now()->addDay())
+                        ->required(),
+                    Forms\Components\Textarea::make('payment_term')
+                        ->label('Payment Term')
+                        ->default('within 5 working days upon Inspection and Acceptance')
+                        ->required(),
+                    Forms\Components\TextInput::make('ors_burs_no')
+                        ->label('ORS/BURS No.'),
+                    Forms\Components\DatePicker::make('ors_burs_date')
+                        ->label('Date of ORS/BURS')
+                        ->maxDate(now())
+                        ->required(),
                 ])
-                ->modalCancelAction(false)
-                ->closeModalByClickingAway(false)
-                ->extraAttributes(['style' => 'display: none;']);
+                ->action(function (array $data) {
+                    $this->record->update($data);
+                    $this->record->refresh();
 
-            return [$bacWarning, $setPoDetails, $lock, $viewPdf];
+                    \App\Helpers\ActivityLogger::log(
+                        'Set PO Details',
+                        'PO details for ' . $this->record->procurement_id . ' were set by ' . \Illuminate\Support\Facades\Auth::user()->name
+                    );
+
+                    Notification::make()
+                        ->title('PO Details updated successfully')
+                        ->success()
+                        ->send();
+                })
+                ->modalSubmitAction(fn ($action) => $action->label('Save Changes')->color('primary'));
+
+            // Lock Action — hide when locked OR fully approved
+            $lock = Actions\Action::make('lock')
+                ->label('Lock')
+                ->icon('heroicon-o-lock-closed')
+                ->color(fn () => $canEdit && !$isLocked && !$this->isFullyApproved() ? 'danger' : 'gray')
+                ->disabled(fn () => !$canEdit || $isLocked || $this->isFullyApproved())
+                ->tooltip(fn () => 
+                    !$canEdit ? 'You do not have permission to lock' : 
+                    ($isLocked ? 'Already locked' : 
+                    ($this->isFullyApproved() ? 'PO is fully approved' : null))
+                )
+                ->requiresConfirmation()
+                ->action(function () {
+                    $this->record->update(['status' => 'Locked']);
+                    $this->record->refresh();
+
+                    // Log the action
+                    \App\Helpers\ActivityLogger::log(
+                        'Locked Purchase Order',
+                        'Purchase Order ' . $this->record->procurement_id . ' was locked by ' . \Illuminate\Support\Facades\Auth::user()->name
+                    );
+
+                    Notification::make()->title('PO locked')->success()->send();
+                })
+                ->visible(fn () => !$isLocked && !$this->isFullyApproved())
+                ->modalSubmitAction(fn ($action) => $action->label('Lock PO')->color('danger'));
+
+            return [$setPoDetails, $lock, $viewPdf];
         }
-
-        return [$setPoDetails, $lock, $viewPdf];
-    }
 
     // Inject the warning modal into the page
     public function getFooter(): ?\Illuminate\Contracts\View\View
@@ -413,5 +415,16 @@ class ViewPo extends ViewRecord
             return view('filament.widgets.approval-warning-modal', $missing);
         }
         return null;
+    }
+
+    // Helper: are all approvers approved?
+    protected function isFullyApproved(): bool
+    {
+        $approvals = $this->record->approvals()
+            ->where('module', 'purchase_order')
+            ->get();
+
+        return $approvals->isNotEmpty()
+            && $approvals->every(fn ($a) => $a->status === 'Approved');
     }
 }

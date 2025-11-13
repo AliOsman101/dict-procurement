@@ -7,6 +7,7 @@ use Filament\Resources\Pages\ViewRecord;
 use Filament\Infolists\Infolist;
 use Filament\Infolists\Components\Section;
 use Filament\Infolists\Components\TextEntry;
+use Filament\Infolists\Components\Grid;
 use Filament\Infolists\Components\RepeatableEntry;
 use Filament\Actions\Action;
 use Filament\Notifications\Notification;
@@ -22,15 +23,41 @@ class ApproverViewPo extends ViewRecord
     public function mount($record): void
     {
         $child = Procurement::where('parent_id', $record)
-                            ->where('module', 'purchase_order')
-                            ->firstOrFail();
+            ->where('module', 'purchase_order')
+            ->firstOrFail();
+
         $this->record = $child;
         $this->record->refresh();
+        $this->record->load('approvals.employee');
     }
 
     public function getTitle(): string
     {
-        return "Purchase Order No. " . ($this->record->procurement_id ?? 'N/A');
+        return "PO No. " . ($this->record->procurement_id ?? 'N/A');
+    }
+
+    protected function hasBacApproved(): bool
+    {
+        if (!$this->record->parent_id) return false;
+
+        $parent = Procurement::find($this->record->parent_id);
+        if (!$parent) return false;
+
+        $bacChild = $parent->children()
+            ->where('module', 'bac_resolution_recommending_award')
+            ->first();
+
+        return $bacChild && $bacChild->status === 'Approved';
+    }
+
+    protected function isFullyApproved(): bool
+    {
+        $approvals = $this->record->approvals()
+            ->where('module', 'purchase_order')
+            ->get();
+
+        return $approvals->isNotEmpty()
+            && $approvals->every(fn ($a) => $a->status === 'Approved');
     }
 
     public function infolist(Infolist $infolist): Infolist
@@ -39,81 +66,86 @@ class ApproverViewPo extends ViewRecord
             ->schema([
                 Section::make('Purchase Order Details')
                     ->schema([
-                        TextEntry::make('procurement_id')
-                            ->label('PO No.'),
+                        TextEntry::make('procurement_id')->label('PO No.'),
                         TextEntry::make('status')
                             ->badge()
-                            ->color(fn (string $state): string => match ($state) {
-                                'Pending' => 'warning',
+                            ->color(fn ($state) => match ($state) {
+                                'Pending'  => 'warning',
                                 'Approved' => 'success',
-                                'Locked' => 'danger',
+                                'Locked'   => 'danger',
                                 'Rejected' => 'danger',
-                                default => 'gray',
+                                default    => 'gray',
+                            })
+                            ->getStateUsing(function ($record) {
+                                $approvals = $record->approvals()->where('module', 'purchase_order')->get();
+                                if ($approvals->isEmpty()) return 'Pending';
+                                if ($approvals->contains('status', 'Rejected')) return 'Rejected';
+                                if ($approvals->every(fn ($a) => $a->status === 'Approved')) return 'Approved';
+                                return $record->status;
                             }),
-                        TextEntry::make('created_at')
-                            ->label('Date Filed')
-                            ->date('Y-m-d'),
+                        TextEntry::make('created_at')->label('Date Filed')->date('Y-m-d'),
                         TextEntry::make('title'),
                         TextEntry::make('requested_by')
                             ->label('Requested By')
-                            ->state(function ($record) {
-                                $parent = $record->parent;
-                                $pr = $parent ? $parent->children()->where('module', 'purchase_request')->first() : null;
-                                return $pr && $pr->requester ? $pr->requester->full_name : 'Not set';
-                            }),
+                            ->getStateUsing(fn ($record) => $record->parent
+                                ?->children()
+                                ->where('module', 'purchase_request')
+                                ->first()
+                                ?->requester
+                                ?->full_name ?? 'Not set'
+                            ),
                         TextEntry::make('procurement_type')
                             ->badge()
-                            ->formatStateUsing(fn ($state) => ucwords(str_replace('_', ' ', $state)))
-                            ->color(fn (string $state) => $state === 'small_value_procurement' ? 'info' : 'primary'),
-                        TextEntry::make('fundCluster.name')
-                            ->label('Fund Cluster'),
-                        TextEntry::make('category.name')
-                            ->label('Category'),
-                        TextEntry::make('delivery_period_display')
-                            ->label('Delivery Period')
-                            ->state(function ($record) {
-                                $parent = $record->parent;
-                                $rfq = $parent ? $parent->children()->where('module', 'request_for_quotation')->first() : null;
-                                if ($rfq && $rfq->delivery_mode === 'days' && $rfq->delivery_value) {
-                                    return "Within {$rfq->delivery_value} calendar days upon receipt of Purchase Order";
-                                }
-                                if ($rfq && $rfq->delivery_mode === 'date' && $rfq->delivery_value) {
-                                    return Carbon::parse($rfq->delivery_value)->format('F j, Y');
-                                }
-                                return 'Not set';
-                            }),
-                        TextEntry::make('deadline_date')
-                            ->label('Submission Deadline')
-                            ->state(function ($record) {
-                                $parent = $record->parent;
-                                $rfq = $parent ? $parent->children()->where('module', 'request_for_quotation')->first() : null;
-                                return $rfq && $rfq->deadline_date instanceof \Carbon\Carbon
-                                    ? $rfq->deadline_date->format('F j, Y, g:i A')
-                                    : 'Not set';
-                            }),
+                            ->color(fn ($state) => $state === 'small_value_procurement' ? 'info' : 'primary')
+                            ->formatStateUsing(fn ($state) => ucwords(str_replace('_', ' ', $state))),
+                        TextEntry::make('fundCluster.name')->label('Fund Cluster'),
+                        TextEntry::make('category.name')->label('Category'),
+
+                        // PO Details with visual feedback
+                        TextEntry::make('place_of_delivery')
+                            ->label('Place of Delivery')
+                            ->badge()
+                            ->color(fn ($state) => $state ? 'success' : 'warning')
+                            ->formatStateUsing(fn ($state) => $state ?: 'Not set'),
+
+                        TextEntry::make('date_of_delivery')
+                            ->label('Date of Delivery')
+                            ->badge()
+                            ->color(fn ($state) => $state ? 'success' : 'warning')
+                            ->formatStateUsing(fn ($state) => $state && $state !== 'N/A' ? Carbon::parse($state)->format('Y-m-d') : 'N/A'),
+
+                        TextEntry::make('payment_term')
+                            ->label('Payment Term')
+                            ->badge()
+                            ->color(fn ($state) => $state ? 'success' : 'warning')
+                            ->formatStateUsing(fn ($state) => $state ?: 'Not set'),
+
+                        TextEntry::make('ors_burs_no')
+                            ->label('ORS/BURS No.')
+                            ->badge()
+                            ->color(fn ($state) => $state ? 'success' : 'warning')
+                            ->formatStateUsing(fn ($state) => $state ?: 'Not set'),
+
+                        TextEntry::make('ors_burs_date')
+                            ->label('Date of ORS/BURS')
+                            ->badge()
+                            ->color(fn ($state) => $state ? 'success' : 'warning')
+                            ->formatStateUsing(fn ($state) => $state && $state !== 'N/A' ? Carbon::parse($state)->format('Y-m-d') : 'N/A'),
                     ])
                     ->columns(4),
+
                 Section::make('Approval Stages')
                     ->schema([
-                        \Filament\Infolists\Components\Grid::make(5)
+                        Grid::make(5)
                             ->schema([
-                                TextEntry::make('hdr_procurement_id')
-                                    ->label('')
-                                    ->state('Procurement ID'),
-                                TextEntry::make('hdr_approver')
-                                    ->label('')
-                                    ->state('Approver'),
-                                TextEntry::make('hdr_sequence')
-                                    ->label('')
-                                    ->state('Sequence'),
-                                TextEntry::make('hdr_status')
-                                    ->label('')
-                                    ->state('Status'),
-                                TextEntry::make('hdr_remarks')
-                                    ->label('')
-                                    ->state('Remarks'),
+                                TextEntry::make('hdr_procurement_id')->label('')->state('Procurement ID'),
+                                TextEntry::make('hdr_approver')->label('')->state('Approver'),
+                                TextEntry::make('hdr_sequence')->label('')->state('Sequence'),
+                                TextEntry::make('hdr_status')->label('')->state('Status'),
+                                TextEntry::make('hdr_date_approved')->label('')->state('Date Approved'), // ← CHANGED
                             ])
                             ->extraAttributes(['class' => 'bg-gray-100 dark:bg-gray-800 border-b']),
+
                         RepeatableEntry::make('approvals')
                             ->label('')
                             ->schema([
@@ -122,36 +154,36 @@ class ApproverViewPo extends ViewRecord
                                 TextEntry::make('sequence')->label('')->alignCenter(),
                                 TextEntry::make('status')
                                     ->label('')
-                                    ->formatStateUsing(function ($state) {
-                                        return sprintf(
-                                            '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
-                                            match ($state) {
-                                                'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
-                                                'Pending' => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
-                                                'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
-                                                default => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
-                                            },
-                                            $state
-                                        );
-                                    })
-                                    ->html(),
-                                TextEntry::make('remarks')
+                                    ->html()
+                                    ->formatStateUsing(fn ($state) => sprintf(
+                                        '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
+                                        match ($state) {
+                                            'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
+                                            'Pending'  => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
+                                            'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
+                                            default    => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
+                                        },
+                                        $state
+                                    )),
+                                TextEntry::make('date_approved') // ← CHANGED FROM `remarks`
                                     ->label('')
-                                    ->default('N/A'),
+                                    ->default('N/A')
+                                    ->formatStateUsing(fn ($state) => $state && $state !== 'N/A' ? Carbon::parse($state)->format('Y-m-d') : 'N/A'),
                             ])
                             ->columns(5)
-                            ->getStateUsing(function ($record) {
-                                $approvals = $record->approvals()
-                                    ->where('module', 'purchase_order')
-                                    ->with('employee')
-                                    ->orderBy('sequence')
-                                    ->get();
-                                return $approvals->isEmpty() ? collect() : $approvals;
-                            }),
+                            ->getStateUsing(fn ($record) => $record->approvals()
+                                ->where('module', 'purchase_order')
+                                ->with('employee')
+                                ->orderBy('sequence')
+                                ->get()
+                            ),
+
                         TextEntry::make('no_approvers')
                             ->label('')
                             ->default('No approvers assigned.')
-                            ->hidden(fn ($record) => $record->approvals()->where('module', 'purchase_order')->count() > 0),
+                            ->hidden(fn ($record) => $record->approvals()
+                                ->where('module', 'purchase_order')
+                                ->count() > 0),
                     ]),
             ]);
     }
@@ -165,11 +197,13 @@ class ApproverViewPo extends ViewRecord
             ->exists();
 
         $canAct = $this->record->status === 'Locked' && $isAssigned;
+
         if ($canAct) {
             $currentApproval = $this->record->approvals()
                 ->where('employee_id', $employeeId)
                 ->where('status', 'Pending')
                 ->first();
+
             if ($currentApproval) {
                 $hasPreviousPending = $this->record->approvals()
                     ->where('module', 'purchase_order')
@@ -186,23 +220,16 @@ class ApproverViewPo extends ViewRecord
             }
         }
 
-        if (!$canAct) {
-            return [
-                Action::make('viewPdf')
-                    ->label('View PDF')
-                    ->icon('heroicon-o-document-text')
-                    ->url(fn () => route('procurements.po.pdf', $this->record), true)
-                    ->color('info'),
-            ];
-        }
-
-        return [
+        $actions = [
             Action::make('viewPdf')
                 ->label('View PDF')
                 ->icon('heroicon-o-document-text')
-                ->url(fn () => route('procurements.po.pdf', $this->record), true)
+                ->url(fn () => route('procurements.po.pdf', $this->record->id), true)
                 ->color('info'),
-            Action::make('approve')
+        ];
+
+        if ($canAct) {
+            $actions[] = Action::make('approve')
                 ->label('Approve')
                 ->icon('heroicon-o-check')
                 ->color('success')
@@ -220,25 +247,26 @@ class ApproverViewPo extends ViewRecord
                             'remarks' => null,
                         ]);
 
-                        $allApproved = $this->record->approvals()->where('module', 'purchase_order')
+                        $allApproved = $this->record->approvals()
+                            ->where('module', 'purchase_order')
                             ->where('status', 'Pending')
                             ->doesntExist();
 
                         if ($allApproved) {
                             $this->record->update(['status' => 'Approved']);
                         }
-                         // ✅ Log approval action
-        \App\Helpers\ActivityLogger::log(
-            'Approved Purchase Order',
-            'Purchase Order ' . $this->record->procurement_id . 
-            ' was approved by ' . \Illuminate\Support\Facades\Auth::user()->name
-        );
 
-                        Notification::make()->title('Purchase Order approved')->success()->send();
+                        ActivityLogger::log(
+                            'Approved Purchase Order',
+                            "PO {$this->record->procurement_id} approved by " . Auth::user()->name
+                        );
+
+                        Notification::make()->title('PO approved')->success()->send();
                         $this->record->refresh();
                     }
-                }),
-            Action::make('reject')
+                });
+
+            $actions[] = Action::make('reject')
                 ->label('Reject')
                 ->icon('heroicon-o-x-mark')
                 ->color('danger')
@@ -263,19 +291,18 @@ class ApproverViewPo extends ViewRecord
 
                         $this->record->update(['status' => 'Rejected']);
                         $this->record->parent->update(['status' => 'Rejected']);
-                        
-                           // ✅ Log rejection action
-        \App\Helpers\ActivityLogger::log(
-            'Rejected Purchase Order',
-            'Purchase Order ' . $this->record->procurement_id . 
-            ' was rejected by ' . \Illuminate\Support\Facades\Auth::user()->name . 
-            ' with remarks: "' . $data['remarks'] . '"'
-        );
 
-                        Notification::make()->title('Purchase Order rejected')->danger()->send();
+                        ActivityLogger::log(
+                            'Rejected Purchase Order',
+                            "PO {$this->record->procurement_id} rejected by " . Auth::user()->name . ": {$data['remarks']}"
+                        );
+
+                        Notification::make()->title('PO rejected')->danger()->send();
                         $this->record->refresh();
                     }
-                }),
-        ];
+                });
+        }
+
+        return $actions;
     }
 }

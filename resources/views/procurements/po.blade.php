@@ -376,8 +376,9 @@
         </tr>
     </table>
 
-    <!-- Fund Cluster -->
+    <!-- Fund Cluster + Accountant Signature 
     <table style="width:100%; border-collapse: collapse; font-size:11px;">
+        <!-- Row 1: Fund Cluster + ORS/BURS No. -->
         <tr>
             <td style="border-left:1px solid black; border-top:1px solid black; border-bottom:none; border-right:none; padding:1px;">
                 <b>Fund Cluster:</b>
@@ -392,6 +393,8 @@
                 <span style="color:purple; font-weight:bold;">{{ $procurement->ors_burs_no ?? 'Not set' }}</span>
             </td>
         </tr>
+
+        <!-- Row 2: Funds Available + Date of ORS/BURS -->
         <tr>
             <td style="border-left:1px solid black; border-bottom:none; border-top:none; border-right:none; padding:1px;">
                 <b>Funds Available:</b>
@@ -411,6 +414,8 @@
                 </span>
             </td>
         </tr>
+
+        <!-- Row 3: Amount (spans left two columns) -->
         <tr>
             <td style="border-left:1px solid black; border-bottom:none; border-top:none; border-right:none; padding:1px;"></td>
             <td style="border-bottom:none; border-top:none; border-left:none; border-right:1px solid black; padding:1px;"></td>
@@ -421,39 +426,35 @@
                 <span style="color:purple; font-weight:bold;">&#8369;{{ number_format($totalContractAmount, 2) }}</span>
             </td>
         </tr>
-    </table>
 
-    <!-- Accountant Signature -->
-    @php
-        $budgetOfficer = \App\Models\DefaultApprover::where('module', 'purchase_order')
-            ->where('designation', 'Budget Officer')
-            ->with('employee')
-            ->first();
-        $budgetOfficerName = $budgetOfficer?->employee 
-            ? strtoupper($budgetOfficer->employee->firstname . ' ' . 
-                ($budgetOfficer->employee->middlename ? substr($budgetOfficer->employee->middlename, 0, 1) . '. ' : '') . 
-                $budgetOfficer->employee->lastname) 
-            : 'JANNETH G. CABINTA';
-        $budgetOfficerDesignation = $budgetOfficer?->designation ?? 'Accountant III';
-    @endphp
-    <table style="width:100%; border-collapse: collapse; font-size:11px;">
+
+        <!-- Row 4: Accountant Signature (spans all 4 columns, bottom border only) -->
+        @php
+            $budgetOfficer = \App\Models\DefaultApprover::where('module', 'purchase_order')
+                ->where('designation', 'Budget Officer')
+                ->with('employee')
+                ->first();
+            $budgetOfficerName = $budgetOfficer?->employee 
+                ? strtoupper($budgetOfficer->employee->firstname . ' ' . 
+                    ($budgetOfficer->employee->middlename ? substr($budgetOfficer->employee->middlename, 0, 1) . '. ' : '') . 
+                    $budgetOfficer->employee->lastname) 
+                : 'JANNETH G. CABINTA';
+            $budgetOfficerDesignation = $budgetOfficer?->designation ?? 'Accountant III';
+        @endphp
         <tr>
-            <!-- Left Signature Cell (same width as Fund Cluster col 1 + col 2) -->
-            <td style="border-left:1px solid black; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
+            <td colspan="2" style="border-left:1px solid black; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
                     padding:30px 10px 5px 10px; text-align:center; width:51.8%;">
                 <div style="border-bottom:1px solid black; display:inline-block; padding-bottom:2px;">
                     <b>{{ $budgetOfficerName }}</b>
                 </div><br>
                 <i>{{ $budgetOfficerDesignation }}</i>
             </td>
-
-            <!-- Right Empty Cell (same width as Fund Cluster col 3 + col 4) -->
-            <td style="border-left:none; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
-                    padding:30px 10px 5px 10px; width:51.5%;">
+            <td colspan="2" style="border-left:none; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
+                    padding:30px 10px 5px 10px; width:48.2%;">
                 <!-- Empty cell -->
             </td>
         </tr>
     </table>
-    
+
 </body>
 </html>

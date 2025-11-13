@@ -3,7 +3,6 @@
 namespace App\Filament\Resources\ProcurementResource\Pages;
 
 use App\Filament\Resources\ProcurementResource;
-use App\Filament\Resources\ProcurementResource\RelationManagers\RfqResponsesRelationManager;
 use Filament\Resources\Pages\ViewRecord;
 use Filament\Infolists\Infolist;
 use Filament\Infolists\Components\Section;
@@ -20,10 +19,18 @@ use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Hidden;
 use Filament\Forms\Components\Placeholder;
 use Filament\Forms\Components\DateTimePicker;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\FileUpload;
+use Filament\Forms\Components\Checkbox;
+use Filament\Forms\Get;
 use Filament\Notifications\Notification;
 use App\Models\Procurement;
 use App\Models\AoqEvaluation;
 use App\Models\RfqResponse;
+use App\Models\Supplier;
+use App\Models\ProcurementItem;
+use App\Models\RfqDistribution;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Database\Eloquent\Model;
@@ -38,6 +45,7 @@ class ViewAoq extends ViewRecord
     protected $tieBreakingMethod = null;
     public $showTieBreakingAnimation = false;
 
+
     // Mount the component and load AOQ data
     public function mount($record): void
     {
@@ -49,17 +57,6 @@ class ViewAoq extends ViewRecord
             $this->record = $aoq;
             $this->loadCustomCollections();
 
-            $hasQuoteEvals = AoqEvaluation::where('procurement_id', $this->record->id)
-                ->where('requirement', 'like', 'quote_%')
-                ->exists();
-            
-            if (!$hasQuoteEvals && 
-                $this->record->status === 'Pending' && 
-                $this->record->rfqResponses->count() > 0 && 
-                $this->record->procurementItems->count() > 0) {
-                
-                $this->detectLowestBids($this->record);
-            }
         } catch (ModelNotFoundException $e) {
             Notification::make()
                 ->title('Error')
@@ -78,88 +75,88 @@ class ViewAoq extends ViewRecord
     }
 
     // Check if RFQ is approved
-protected function hasRfqApproved(): bool
-{
-    if (!$this->record->parent_id) {
-        return false;
-    }
-
-    $parent = Procurement::find($this->record->parent_id);
-    
-    if (!$parent) {
-        return false;
-    }
-
-    $rfqChild = $parent->children()->where('module', 'request_for_quotation')->first();
-    
-    if ($rfqChild) {
-        $approvals = $rfqChild->approvals()->where('module', 'request_for_quotation')->get();
-        
-        if ($approvals->isEmpty()) {
+    protected function hasRfqApproved(): bool
+    {
+        if (!$this->record->parent_id) {
             return false;
         }
+
+        $parent = Procurement::find($this->record->parent_id);
         
-        return $approvals->every(fn ($approval) => $approval->status === 'Approved');
+        if (!$parent) {
+            return false;
+        }
+
+        $rfqChild = $parent->children()->where('module', 'request_for_quotation')->first();
+        
+        if ($rfqChild) {
+            $approvals = $rfqChild->approvals()->where('module', 'request_for_quotation')->get();
+            
+            if ($approvals->isEmpty()) {
+                return false;
+            }
+            
+            return $approvals->every(fn ($approval) => $approval->status === 'Approved');
+        }
+
+        return false;
     }
 
-    return false;
-}
+    // Get the first missing requirement in the procurement chain
+    protected function getFirstMissingRequirement(): ?array
+    {
+        if (!$this->record->parent_id) {
+            return null;
+        }
 
-// Get the first missing requirement in the procurement chain
-protected function getFirstMissingRequirement(): ?array
-{
-    if (!$this->record->parent_id) {
-        return null;
+        $parent = Procurement::find($this->record->parent_id);
+        if (!$parent) return null;
+
+        // 1. Check PPMP
+        $ppmpChild = $parent->children()->where('module', 'ppmp')->first();
+        if (!$ppmpChild || !$ppmpChild->documents()->where('module', 'ppmp')->exists()) {
+            return [
+                'title' => 'PPMP Required',
+                'message' => 'You must upload a <strong class="text-danger-600 dark:text-danger-400 font-semibold">PPMP document</strong> first before proceeding with this Abstract of Quotation.',
+                'url' => route('filament.admin.resources.procurements.view-ppmp', $parent->id),
+                'buttonLabel' => 'Go to PPMP'
+            ];
+        }
+
+        // 2. Check PR Approved
+        $prChild = $parent->children()->where('module', 'purchase_request')->first();
+        if (!$prChild || $prChild->status !== 'Approved') {
+            return [
+                'title' => 'PR Approval Required',
+                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Purchase Request must be approved</strong> first before proceeding with this Abstract of Quotation.',
+                'url' => route('filament.admin.resources.procurements.view-pr', $parent->id),
+                'buttonLabel' => 'Go to PR'
+            ];
+        }
+
+        // 3. Check RFQ Approved
+        $rfqChild = $parent->children()->where('module', 'request_for_quotation')->first();
+        if (!$rfqChild) {
+            return [
+                'title' => 'RFQ Not Found',
+                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation</strong> has not been created yet.',
+                'url' => route('filament.admin.resources.procurements.view', $parent->id),
+                'buttonLabel' => 'Go to Procurement'
+            ];
+        }
+
+        $approvals = $rfqChild->approvals()->where('module', 'request_for_quotation')->get();
+        if ($approvals->isEmpty() || !$approvals->every(fn ($approval) => $approval->status === 'Approved')) {
+            return [
+                'title' => 'RFQ Approval Required',
+                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation (RFQ)</strong> must be approved first before proceeding with this Abstract of Quotation.',
+                'url' => route('filament.admin.resources.procurements.view-rfq', $parent->id),
+                'buttonLabel' => 'Go to RFQ'
+            ];
+        }
+
+        return null; // All requirements met
     }
-
-    $parent = Procurement::find($this->record->parent_id);
-    if (!$parent) return null;
-
-    // 1. Check PPMP
-    $ppmpChild = $parent->children()->where('module', 'ppmp')->first();
-    if (!$ppmpChild || !$ppmpChild->documents()->where('module', 'ppmp')->exists()) {
-        return [
-            'title' => 'PPMP Required',
-            'message' => 'You must upload a <strong class="text-danger-600 dark:text-danger-400 font-semibold">PPMP document</strong> first before proceeding with this Abstract of Quotation.',
-            'url' => route('filament.admin.resources.procurements.view-ppmp', $parent->id),
-            'buttonLabel' => 'Go to PPMP'
-        ];
-    }
-
-    // 2. Check PR Approved
-    $prChild = $parent->children()->where('module', 'purchase_request')->first();
-    if (!$prChild || $prChild->status !== 'Approved') {
-        return [
-            'title' => 'PR Approval Required',
-            'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Purchase Request must be approved</strong> first before proceeding with this Abstract of Quotation.',
-            'url' => route('filament.admin.resources.procurements.view-pr', $parent->id),
-            'buttonLabel' => 'Go to PR'
-        ];
-    }
-
-    // 3. Check RFQ Approved
-    $rfqChild = $parent->children()->where('module', 'request_for_quotation')->first();
-    if (!$rfqChild) {
-        return [
-            'title' => 'RFQ Not Found',
-            'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation</strong> has not been created yet.',
-            'url' => route('filament.admin.resources.procurements.view', $parent->id),
-            'buttonLabel' => 'Go to Procurement'
-        ];
-    }
-
-    $approvals = $rfqChild->approvals()->where('module', 'request_for_quotation')->get();
-    if ($approvals->isEmpty() || !$approvals->every(fn ($approval) => $approval->status === 'Approved')) {
-        return [
-            'title' => 'RFQ Approval Required',
-            'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation (RFQ)</strong> must be approved first before proceeding with this Abstract of Quotation.',
-            'url' => route('filament.admin.resources.procurements.view-rfq', $parent->id),
-            'buttonLabel' => 'Go to RFQ'
-        ];
-    }
-
-    return null; // All requirements met
-}
 
     // Load related data for the AOQ record
     protected function loadCustomCollections(): void
@@ -224,6 +221,17 @@ protected function getFirstMissingRequirement(): ?array
         if ($this->record) {
             $this->loadCustomCollections();
         }
+    }
+
+    private function isSupplierEvaluated($responseId): bool
+    {
+        if (!$responseId) {
+            return false;
+        }
+
+        return AoqEvaluation::where('procurement_id', $this->record->id)
+            ->where('rfq_response_id', $responseId)
+            ->exists();
     }
 
     // Detect lowest bids and mark evaluations
@@ -487,6 +495,567 @@ protected function getFirstMissingRequirement(): ?array
             ->exists();
     }
 
+    // Get RFQ response form schema
+    protected function getRfqResponseFormSchema(): array
+    {
+        return [
+            FormSection::make('RFQ Response Details')
+                ->schema([
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            Select::make('supplier_id')
+                                ->label('Supplier')
+                                ->options(function (Get $get) {
+                                    $rfq = Procurement::where('parent_id', $this->record->parent_id)
+                                        ->where('module', 'request_for_quotation')
+                                        ->first();
+
+                                    if (!$rfq) return [];
+
+                                    // Get all distributed suppliers
+                                    $distributed = RfqDistribution::where('procurement_id', $rfq->id)
+                                        ->with('supplier')
+                                        ->get();
+
+                                    // Get all suppliers who already submitted a response
+                                    $respondedSupplierIds = RfqResponse::where('procurement_id', $rfq->id)
+                                        ->pluck('supplier_id')
+                                        ->toArray();
+
+                                    // Filter out suppliers who already responded
+                                    $availableSuppliers = $distributed->filter(function ($dist) use ($respondedSupplierIds) {
+                                        return !in_array($dist->supplier_id, $respondedSupplierIds);
+                                    });
+
+                                    $options = $availableSuppliers->pluck('supplier.business_name', 'supplier_id')->toArray();
+
+                                    // If editing an existing response, ensure the current supplier is included
+                                    $currentId = $get('supplier_id');
+                                    if ($currentId && !isset($options[$currentId])) {
+                                        $supplier = Supplier::find($currentId);
+                                        if ($supplier) {
+                                            $options[$currentId] = $supplier->business_name;
+                                        }
+                                    }
+
+                                    return $options;
+                                })
+                                ->required()
+                                ->reactive()
+                                ->searchable()
+                                ->preload()
+                                ->disabled(fn (Get $get) => filled($get('supplier_id')))
+                                ->dehydrated(fn (Get $get) => filled($get('supplier_id')))
+                                ->afterStateUpdated(function (callable $set, $state) {
+                                    if ($state) {
+                                        $supplier = Supplier::find($state);
+                                        if ($supplier) {
+                                            $set('business_name', $supplier->business_name);
+                                            $set('business_address', $supplier->business_address);
+                                            $set('contact_no', $supplier->contact_no);
+                                            $set('email_address', $supplier->email_address);
+                                            $set('tin', $supplier->tin);
+                                            $set('vat', $supplier->vat);
+                                            $set('nvat', $supplier->nvat);
+                                            $set('philgeps_reg_no', $supplier->philgeps_reg_no);
+                                            $set('lbp_account_name', $supplier->lbp_account_name);
+                                            $set('lbp_account_number', $supplier->lbp_account_number);
+
+                                            // Auto-fill documents from supplier's existing files
+                                            $procurement = $this->record;
+                                            $pr = $procurement->parent->children()->where('module', 'purchase_request')->first();
+                                            $abc = $pr?->grand_total ?? 0;
+                                            $categoryName = $procurement->category?->name ?? '';
+
+                                            $requirements = $this->getRequiredDocuments($categoryName, $abc);
+
+                                            $availableDocs = $supplier->getAvailableDocuments();
+                                            foreach ($requirements as $requirement) {
+                                                if (isset($availableDocs[$requirement])) {
+                                                    $path = $availableDocs[$requirement];
+                                                    if (Storage::disk('public')->exists($path)) {
+                                                        $set("documents.{$requirement}", [$path]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }),
+                            
+                            TextInput::make('submitted_by')
+                                ->label('Submitted By')
+                                ->required()
+                                ->maxLength(255),
+                        ]),
+                    
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            TextInput::make('designation')
+                                ->label('Designation')
+                                ->required()
+                                ->maxLength(255),
+                            DatePicker::make('submitted_date')
+                                ->label('Submission Date')
+                                ->required()
+                                ->default(now()),
+                        ]),
+                    
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            TextInput::make('business_name')
+                                ->label('Business Name')
+                                ->required()
+                                ->maxLength(255),
+                            TextInput::make('philgeps_reg_no')
+                                ->label('PhilGEPS Registration No.')
+                                ->maxLength(255)
+                                ->nullable(),
+                        ]),
+                    
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            Textarea::make('business_address')
+                                ->label('Business Address')
+                                ->required()
+                                ->rows(4),
+                            Forms\Components\Group::make()
+                                ->schema([
+                                    TextInput::make('tin')
+                                        ->label('TIN')
+                                        ->maxLength(255)
+                                        ->nullable(),
+                                    Checkbox::make('vat')
+                                        ->label('VAT Registered')
+                                        ->live()
+                                        ->afterStateUpdated(function (callable $set, $state) {
+                                            if ($state) {
+                                                $set('nvat', false);
+                                            }
+                                        }),
+                                    Checkbox::make('nvat')
+                                        ->label('NVAT Registered')
+                                        ->live()
+                                        ->afterStateUpdated(function (callable $set, $state) {
+                                            if ($state) {
+                                                $set('vat', false);
+                                            }
+                                        }),
+                                ]),
+                        ]),
+                    
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            TextInput::make('contact_no')
+                                ->label('Contact Number')
+                                ->tel()
+                                ->required()
+                                ->maxLength(255),
+                            TextInput::make('lbp_account_name')
+                                ->label('LBP Account Name')
+                                ->maxLength(255)
+                                ->nullable(),
+                        ]),
+                    
+                    Forms\Components\Grid::make(2)
+                        ->schema([
+                            TextInput::make('email_address')
+                                ->label('Email Address')
+                                ->email()
+                                ->required()
+                                ->maxLength(255),
+                            TextInput::make('lbp_account_number')
+                                ->label('LBP Account Number')
+                                ->maxLength(255)
+                                ->nullable(),
+                        ]),
+                ])
+                ->columns(2),
+
+            FormSection::make('Original RFQ Document')
+                ->description('Upload a copy of the original RFQ document submitted by the supplier as proof')
+                ->schema([
+                    FileUpload::make('rfq_document')
+                        ->label('RFQ Document Copy')
+                        ->disk('public')
+                        ->directory('rfq-original-documents')
+                        ->acceptedFileTypes(['application/pdf'])
+                        ->maxSize(10240)
+                        ->required()
+                        ->helperText('Upload the original RFQ document submitted by the supplier')
+                        ->getUploadedFileNameForStorageUsing(function ($file, Get $get) {
+                            $supplierId = $get('supplier_id') ?? 'new';
+                            $timestamp = time();
+                            $extension = $file->getClientOriginalExtension();
+                            return "supplier_{$supplierId}_rfq_document_{$timestamp}.{$extension}";
+                        })
+                        ->afterStateHydrated(function ($component, $state) {
+                            if (is_string($state) && !empty($state)) {
+                                $component->state([$state]);
+                            }
+                        })
+                        ->dehydrateStateUsing(function ($state) {
+                            if (is_array($state) && !empty($state)) {
+                                return isset($state[0]) ? $state[0] : reset($state);
+                            }
+                            return is_string($state) ? $state : null;
+                        })
+                        ->deleteUploadedFileUsing(function ($file) {
+                            if (is_string($file)) {
+                                Storage::disk('public')->delete($file);
+                            }
+                        })
+                        ->deletable(true)
+                        ->downloadable(true)
+                        ->columnSpanFull(),
+                ])
+                ->columns(1)
+                ->collapsible(),
+
+            FormSection::make('Supplier Documents')
+                ->description('Documents will be pre-filled from supplier records when available. You can replace them with updated versions.')
+                ->schema($this->getDocumentUploads())
+                ->columns(1)
+                ->collapsible(),
+
+            FormSection::make('Item Quotes')
+                ->schema([
+                    Repeater::make('quotes')
+                        ->schema([
+                            Forms\Components\Hidden::make('procurement_item_id')
+                                ->required(),
+
+                            Forms\Components\Grid::make(2)
+                                ->schema([
+                                    Forms\Components\Group::make()
+                                        ->schema([
+                                            TextInput::make('item_no')
+                                                ->label(fn () => $this->record->parent->children()->where('module', 'purchase_request')->first()->basis === 'lot' ? 'Lot No.' : 'Item No.')
+                                                ->numeric()
+                                                ->readOnly(),
+                                            TextInput::make('unit')
+                                                ->label('Unit')
+                                                ->readOnly(),
+                                            Textarea::make('item_description')
+                                                ->label(fn () => $this->record->parent->children()->where('module', 'purchase_request')->first()->basis === 'lot' ? 'Lot Description' : 'Item Description')
+                                                ->readOnly()
+                                                ->rows(2),
+                                        ])
+                                        ->columnSpan(1),
+
+                                    Forms\Components\Group::make()
+                                        ->schema([
+                                            TextInput::make('unit_value')
+                                                ->label('Unit Value')
+                                                ->numeric()
+                                                ->prefix('₱')
+                                                ->required()
+                                                ->minValue(0)
+                                                ->reactive()
+                                                ->afterStateUpdated(function ($state, callable $set, callable $get) {
+                                                    $quantity = $get('quantity') ?? 1;
+                                                    $set('total_value', (float) $state * (float) $quantity);
+                                                }),
+                                            TextInput::make('total_value')
+                                                ->label('Total Value')
+                                                ->numeric()
+                                                ->prefix('₱')
+                                                ->required()
+                                                ->minValue(0)
+                                                ->readOnly(),
+                                            Textarea::make('specifications')
+                                                ->label('Specifications (Brand/Model/Others)')
+                                                ->rows(2)
+                                                ->required(),
+                                        ])
+                                        ->columnSpan(1),
+                                ]),
+
+                            Forms\Components\Grid::make(2)
+                                ->schema([
+                                    Forms\Components\Group::make()
+                                        ->schema([
+                                            TextInput::make('quantity')
+                                                ->label('Quantity')
+                                                ->numeric()
+                                                ->readOnly(),
+                                            TextInput::make('total_cost')
+                                                ->label('Total ABC')
+                                                ->numeric()
+                                                ->prefix('₱')
+                                                ->readOnly(),
+                                        ])
+                                        ->columnSpan(1),
+
+                                    Forms\Components\Group::make()
+                                        ->schema([
+                                            Toggle::make('statement_of_compliance')
+                                                ->label('Complies')
+                                                ->required()
+                                                ->default(true),
+                                        ])
+                                        ->columnSpan(1)
+                                        ->extraAttributes(['class' => 'ml-auto']),
+                                ]),
+                        ])
+                        ->default(function () {
+                            $procurementId = $this->getProcurementIdForItems();
+                            return ProcurementItem::where('procurement_id', $procurementId)
+                                ->orderBy('sort')
+                                ->get()
+                                ->map(fn ($item) => [
+                                    'procurement_item_id' => $item->id,
+                                    'item_no' => $item->sort,
+                                    'unit' => $item->unit,
+                                    'quantity' => $item->quantity,
+                                    'item_description' => $item->item_description,
+                                    'total_cost' => $item->total_cost,
+                                    'statement_of_compliance' => true,
+                                    'specifications' => null,
+                                    'unit_value' => null,
+                                    'total_value' => null,
+                                ])
+                                ->toArray();
+                        })
+                        ->addable(false)
+                        ->deletable(false)
+                        ->reorderable(false),
+                ]),
+        ];
+    }
+
+    protected function getProcurementIdForItems(): int
+    {
+        $rfq = Procurement::where('parent_id', $this->record->parent_id)
+            ->where('module', 'request_for_quotation')
+            ->first();
+        $purchaseRequest = Procurement::where('parent_id', $this->record->parent_id)
+            ->where('module', 'purchase_request')
+            ->first();
+        return $purchaseRequest ? $purchaseRequest->id : $this->record->parent_id;
+    }
+
+    protected function getRequiredDocuments(string $categoryName, float $abc): array
+    {
+        $requirements = ['mayors_permit', 'philgeps_certificate'];
+        if (str_contains(strtolower($categoryName), 'infrastructure')) $requirements[] = 'pcab_license';
+        if (str_contains(strtolower($categoryName), 'consulting')) $requirements[] = 'professional_license_cv';
+        if (str_contains(strtolower($categoryName), 'catering') || str_contains(strtolower($categoryName), 'printing')) $requirements[] = 'terms_conditions_tech_specs';
+        if ($abc > 500000) $requirements[] = 'tax_return';
+        $requirements[] = 'omnibus_sworn_statement';
+        return $requirements;
+    }
+
+    protected function getDocumentUploads(): array
+    {
+        $procurement = $this->record;
+        $abc = $procurement->parent->children()->where('module', 'purchase_request')->first()->grand_total ?? 0;
+        $categoryName = $procurement->category->name ?? '';
+        $requirements = $this->getRequiredDocuments($categoryName, $abc);
+        $schema = [];
+
+        foreach ($requirements as $requirement) {
+            $schema[] = FileUpload::make("documents.{$requirement}")
+                ->label(ucwords(str_replace('_', ' ', $requirement)))
+                ->disk('public')
+                ->directory('supplier-documents')
+                ->acceptedFileTypes(['application/pdf'])
+                ->maxSize(10240)
+                ->required($requirement !== 'omnibus_sworn_statement' || $abc >= 50000)
+                ->helperText($requirement === 'omnibus_sworn_statement' && $abc < 50000 ? 'Optional for ABC below 50k' : 'Required')
+                ->getUploadedFileNameForStorageUsing(function ($file, Get $get) use ($requirement) {
+                    $supplierId = $get('supplier_id') ?? 'new';
+                    $extension = $file->getClientOriginalExtension();
+                    return "supplier_{$supplierId}_{$requirement}_" . time() . ".{$extension}";
+                })
+                ->afterStateHydrated(fn ($component, $state) => is_string($state) && $state ? $component->state([$state]) : null)
+                ->dehydrateStateUsing(fn ($state) => is_array($state) ? (reset($state) ?: null) : (is_string($state) ? $state : null))
+                ->deletable()
+                ->downloadable();
+        }
+        return $schema;
+    }
+
+    public function editResponseModalAction(): Action
+    {
+        return Action::make('editResponseModal')
+            ->label('Edit')
+            ->modalHeading('Edit RFQ Response')
+            ->modalSubmitActionLabel('Update Response')
+            ->color('primary')
+            ->icon('heroicon-o-pencil')
+            ->modalWidth('7xl')
+            ->fillForm(fn (array $arguments) => $this->fillEditForm($arguments['responseId'] ?? null))
+            ->form($this->getRfqResponseFormSchema())
+            ->action(fn (array $data, array $arguments) => $this->updateResponse($data, $arguments['responseId'] ?? null))
+            ->visible(fn (array $arguments) => !$this->isSupplierEvaluated($arguments['responseId'] ?? null))
+            ->tooltip(fn (array $arguments) => $this->isSupplierEvaluated($arguments['responseId'] ?? null) ? 'Cannot edit: Supplier has been evaluated' : null);
+    }
+
+    public function deleteResponseModalAction(): Action
+    {
+        return Action::make('deleteResponseModal')
+            ->label('Delete')
+            ->modalHeading('Delete RFQ Response')
+            ->modalDescription('Are you sure you want to delete this supplier response? This action cannot be undone.')
+            ->modalSubmitActionLabel('Delete')
+            ->requiresConfirmation()
+            ->color('danger')
+            ->icon('heroicon-o-trash')
+            ->action(fn (array $arguments) => $this->deleteResponse($arguments['responseId'] ?? null))
+            ->visible(fn (array $arguments) => !$this->isSupplierEvaluated($arguments['responseId'] ?? null))
+            ->tooltip(fn (array $arguments) => $this->isSupplierEvaluated($arguments['responseId'] ?? null) ? 'Cannot delete: Supplier has been evaluated' : null);
+    }
+
+    private function fillEditForm($responseId)
+    {
+        if (!$responseId) return [];
+        $record = RfqResponse::with('supplier')->find($responseId);
+        if (!$record) return [];
+
+        $data = $record->toArray();
+
+        $data['supplier_id'] = $record->supplier_id;
+
+        $supplier = $record->supplier;
+
+        if ($supplier) {
+            foreach ([
+                'business_name', 'business_address', 'contact_no', 'email_address',
+                'tin', 'vat', 'nvat', 'philgeps_reg_no',
+                'lbp_account_name', 'lbp_account_number'
+            ] as $field) {
+                $data[$field] = $data[$field] ?? $supplier->{$field};
+            }
+        }
+
+        // Handle documents safely
+        $docs = [];
+
+        if (!empty($record->documents)) {
+            $decoded = is_string($record->documents)
+                ? json_decode($record->documents, true)
+                : $record->documents;
+
+            if (is_array($decoded)) {
+                foreach ($decoded as $key => $value) {
+                    // Only include if value is a non-empty string (valid file path)
+                    if (is_string($value) && $value !== '') {
+                        $docs[$key] = [$value];
+                    }
+                }
+            }
+        }
+
+        $data['documents'] = $docs; // Always an array
+
+        $data['rfq_document'] = $record->rfq_document;
+
+        // Quotes
+        $itemsProcurementId = $this->getProcurementIdForItems();
+        $items = ProcurementItem::where('procurement_id', $itemsProcurementId)->orderBy('sort')->get();
+
+        $data['quotes'] = $items->map(function ($item) use ($record) {
+            $quote = $record->quotes->firstWhere('procurement_item_id', $item->id);
+            return [
+                'id' => $quote?->id,
+                'procurement_item_id' => $item->id,
+                'item_no' => $item->sort,
+                'unit' => $item->unit,
+                'quantity' => $item->quantity,
+                'item_description' => $item->item_description,
+                'total_cost' => $item->total_cost,
+                'statement_of_compliance' => $quote?->statement_of_compliance ?? true,
+                'specifications' => $quote?->specifications,
+                'unit_value' => $quote?->unit_value,
+                'total_value' => $quote?->total_value,
+            ];
+        })->toArray();
+
+        return $data;
+    }
+
+    private function updateResponse($data, $responseId)
+    {
+        if (!$responseId) return;
+        $rfqResponse = RfqResponse::find($responseId);
+        if (!$rfqResponse) return;
+
+        $supplier = Supplier::find($data['supplier_id']);
+        if ($supplier) {
+            if (isset($data['documents'])) {
+                $this->updateSupplierDocuments($supplier, $data['documents']);
+            }
+
+            $supplier->update(collect($data)->only([
+                'business_name', 'business_address', 'contact_no', 'email_address',
+                'tin', 'vat', 'nvat', 'philgeps_reg_no',
+                'lbp_account_name', 'lbp_account_number'
+            ])->toArray());
+        }
+
+        $quotes = $data['quotes'] ?? [];
+        unset($data['quotes']);
+        $rfqResponse->update($data);
+
+        foreach ($quotes as $quoteData) {
+            if (isset($quoteData['procurement_item_id'])) {
+                $rfqResponse->quotes()->updateOrCreate(
+                    ['procurement_item_id' => $quoteData['procurement_item_id']],
+                    collect($quoteData)->only([
+                        'unit_value', 'total_value', 'specifications', 'statement_of_compliance'
+                    ])->toArray()
+                );
+            }
+        }
+
+        Notification::make()->title('Response Updated')->success()->send();
+        redirect()->route('filament.admin.resources.procurements.view-aoq', $this->record->parent_id);
+    }
+
+    private function deleteResponse($responseId)
+    {
+        if (!$responseId) return;
+        $rfqResponse = RfqResponse::find($responseId);
+        if (!$rfqResponse) {
+            Notification::make()->title('Not Found')->danger()->send();
+            return;
+        }
+
+        if ($rfqResponse->rfq_document && Storage::disk('public')->exists($rfqResponse->rfq_document)) {
+            Storage::disk('public')->delete($rfqResponse->rfq_document);
+        }
+
+        $supplierName = $rfqResponse->supplier?->business_name ?? 'Unknown';
+        $rfqResponse->delete();
+
+        ActivityLogger::log('Supplier Response Deleted', "Response from $supplierName deleted by " . auth()->user()?->name);
+        Notification::make()->title('Response Deleted')->success()->send();
+        redirect()->route('filament.admin.resources.procurements.view-aoq', $this->record->parent_id);
+    }
+
+    /**
+     * Update supplier document columns with the new uploaded files.
+     * Old files are deleted when they differ from the new path.
+     */
+    private function updateSupplierDocuments(Supplier $supplier, array $documents): void
+    {
+        foreach ($documents as $requirement => $filePath) {
+            if (!$filePath || !is_string($filePath)) {
+                continue;
+            }
+
+            $oldPath = $supplier->{$requirement};
+
+            // Delete the previous file if it exists and is different
+            if ($oldPath && $oldPath !== $filePath && Storage::disk('public')->exists($oldPath)) {
+                Storage::disk('public')->delete($oldPath);
+            }
+
+            // Save the new path in the supplier table
+            $supplier->update([$requirement => $filePath]);
+        }
+    }
+
     // Define infolist schema for displaying AOQ details
     public function infolist(Infolist $infolist): Infolist
     {
@@ -570,7 +1139,7 @@ protected function getFirstMissingRequirement(): ?array
                                             ->orWhere('requirement', 'rfq_document');
                                     })
                                     ->count();
-                                    
+                                        
                                 if ($totalDocs === 0) return 'No Documents';
                                 return $evaluatedDocs >= $totalDocs ? 'Complete' : "Partial ({$evaluatedDocs}/{$totalDocs})";
                             }),
@@ -634,7 +1203,7 @@ protected function getFirstMissingRequirement(): ?array
                             ->hidden(fn ($record) => $record->procurementItems->count() > 0),
                     ]),
 
-                // MOVED: Supplier Responses section now comes BEFORE Supplier Evaluations
+                // Supplier Responses Section (moved before Supplier Evaluations)
                 Section::make('Supplier Responses')
                     ->collapsible()
                     ->collapsed(false)
@@ -684,6 +1253,21 @@ protected function getFirstMissingRequirement(): ?array
                                 $html = '';
                                 $hasAnyEvaluations = AoqEvaluation::where('procurement_id', $record->id)->exists();
 
+                                // Compute evaluation completeness
+                                $totalDocs = $record->rfqResponses->sum(function($r) {
+                                    $docCount = is_array($r->documents) ? count($r->documents) : 0;
+                                    return $docCount + (!empty($r->rfq_document) ? 1 : 0);
+                                });
+                                
+                                $evaluatedDocs = AoqEvaluation::where('procurement_id', $record->id)
+                                    ->where(function($query) {
+                                        $query->where('requirement', 'not like', 'quote_%')
+                                            ->orWhere('requirement', 'rfq_document');
+                                    })
+                                    ->count();
+                                
+                                $evaluationComplete = $totalDocs > 0 && $evaluatedDocs >= $totalDocs;
+
                                 foreach ($record->rfqResponses as $rfqResponse) {
                                     $supplierName = $rfqResponse->supplier?->business_name ?? $rfqResponse->business_name ?? 'Unknown Supplier';
 
@@ -698,7 +1282,8 @@ protected function getFirstMissingRequirement(): ?array
                                     $docEvals = $evaluations->keyBy('requirement');
                                     $hasFailedDocs = $evaluations->where('status', 'fail')->isNotEmpty();
 
-                                    $hasWinningBids = $hasAnyEvaluations && AoqEvaluation::where('procurement_id', $record->id)
+                                    // Only show winning bids if evaluations are complete
+                                    $hasWinningBids = $evaluationComplete && $hasAnyEvaluations && AoqEvaluation::where('procurement_id', $record->id)
                                         ->where('rfq_response_id', $rfqResponse->id)
                                         ->where('lowest_bid', true)
                                         ->exists();
@@ -977,6 +1562,16 @@ protected function getFirstMissingRequirement(): ?array
             ->count();
         
         $evaluationComplete = $totalDocs > 0 && $evaluatedDocs >= $totalDocs;
+        
+        // Get RFQ for checking bid opening time
+        $rfq = Procurement::where('parent_id', $this->record->parent_id)
+            ->where('module', 'request_for_quotation')
+            ->first();
+        
+        $canShowCreateResponse = !$isLocked && 
+            !is_null($this->record->bid_opening_datetime) && 
+            Carbon::now()->greaterThanOrEqualTo($this->record->bid_opening_datetime);
+        
         return [
             Action::make('setBidOpening')
                 ->label('Set Bid Opening')
@@ -1041,6 +1636,87 @@ protected function getFirstMissingRequirement(): ?array
                 ->url(fn () => route('procurements.aoq.pdf', $this->record->parent_id), true)
                 ->openUrlInNewTab()
                 ->color('info'),
+
+            Action::make('createResponse')
+                ->label('Create Response')
+                ->icon('heroicon-o-plus')
+                ->color('success')
+                ->modalHeading('Create RFQ Response')
+                ->modalSubmitActionLabel('Create Response')
+                ->modalWidth('7xl')
+                ->form($this->getRfqResponseFormSchema())
+                ->action(function (array $data) {
+                    $rfq = Procurement::where('parent_id', $this->record->parent_id)
+                        ->where('module', 'request_for_quotation')
+                        ->first();
+
+                    if (!$rfq) {
+                        Notification::make()
+                            ->title('Error')
+                            ->body('RFQ not found for this AOQ.')
+                            ->danger()
+                            ->send();
+                        return;
+                    }
+
+                    $supplier = Supplier::find($data['supplier_id']);
+                    if ($supplier && isset($data['documents'])) {
+                        $this->updateSupplierDocuments($supplier, $data['documents']);
+                    }
+                    if ($supplier) {
+                        $supplier->update(collect($data)->only([
+                            'business_name', 'business_address', 'contact_no', 'email_address',
+                            'tin', 'vat', 'nvat', 'philgeps_reg_no',
+                            'lbp_account_name', 'lbp_account_number'
+                        ])->toArray());
+                    }
+
+                    $quotes = $data['quotes'] ?? [];
+                    unset($data['quotes']);
+
+                    $data['procurement_id'] = $rfq->id;
+                    $rfqResponse = RfqResponse::create($data);
+
+                    foreach ($quotes as $quoteData) {
+                        $rfqResponse->quotes()->create([
+                            'procurement_item_id' => $quoteData['procurement_item_id'],
+                            'unit_value'          => $quoteData['unit_value'] ?? 0,
+                            'total_value'         => $quoteData['total_value'] ?? 0,
+                            'specifications'      => $quoteData['specifications'] ?? null,
+                            'statement_of_compliance' => $quoteData['statement_of_compliance'] ?? true,
+                        ]);
+                    }
+
+                    ActivityLogger::log(
+                        'Supplier Response Created',
+                        'Supplier response from ' . ($rfqResponse->supplier->business_name ?? 'Unknown Supplier') .
+                        ' was submitted for RFQ ' . ($rfq->procurement_id ?? 'N/A') .
+                        ' by ' . (Auth::user()->name ?? 'System')
+                    );
+
+                    Notification::make()
+                        ->title('Response Created')
+                        ->body('Supplier response created successfully.')
+                        ->success()
+                        ->send();
+
+                    redirect()->route('filament.admin.resources.procurements.view-aoq', $this->record->parent_id);
+                })
+                ->visible(function () use ($canShowCreateResponse) {
+                    if (!$canShowCreateResponse) return false;
+                    
+                    // Check if all distributed suppliers have submitted responses
+                    $rfq = Procurement::where('parent_id', $this->record->parent_id)
+                        ->where('module', 'request_for_quotation')
+                        ->first();
+                    
+                    if (!$rfq) return false;
+                    
+                    $distributedCount = RfqDistribution::where('procurement_id', $rfq->id)->count();
+                    $responseCount = RfqResponse::where('procurement_id', $rfq->id)->count();
+                    
+                    return $responseCount < $distributedCount;
+                }),
 
             Action::make('evaluate')
                 ->label('Evaluate Suppliers')
@@ -1133,6 +1809,20 @@ protected function getFirstMissingRequirement(): ?array
                 })
                 ->visible(function () use ($isLocked, $evaluationComplete) {
                     if ($isLocked) return false;
+                    
+                    // Check if all distributed suppliers have submitted responses
+                    $rfq = Procurement::where('parent_id', $this->record->parent_id)
+                        ->where('module', 'request_for_quotation')
+                        ->first();
+                    
+                    if (!$rfq) return false;
+                    
+                    $distributedCount = RfqDistribution::where('procurement_id', $rfq->id)->count();
+                    $responseCount = RfqResponse::where('procurement_id', $rfq->id)->count();
+                    
+                    // Only show if all suppliers have responded
+                    if ($responseCount < $distributedCount) return false;
+                    
                     return !$evaluationComplete &&
                         in_array($this->record->status, ['Pending', 'Evaluated']) &&
                         $this->record->rfqResponses->count() > 0 &&
@@ -1201,7 +1891,7 @@ protected function getFirstMissingRequirement(): ?array
                 ->label('View Tie-Breaking Details')
                 ->icon('heroicon-o-clipboard-document-check')
                 ->color('info')
-                ->visible(function () use ($hasTieBreakingRecord, $isLocked) {
+                ->visible(function () use ($hasTieBreakingRecord) {
                     return $hasTieBreakingRecord;
                 })
                 ->modalContent(function () {
@@ -1232,7 +1922,7 @@ protected function getFirstMissingRequirement(): ?array
                     ->icon('heroicon-o-x-mark')
                     ->button()
                 ),
-            
+                
             Action::make('lock')
                 ->label('Lock')
                 ->icon('heroicon-o-lock-closed')
@@ -1245,9 +1935,9 @@ protected function getFirstMissingRequirement(): ?array
                     $this->record->refresh();
 
                     ActivityLogger::log(
-        'Locked Abstract of Quotation',
-        'Abstract of Quotation' . $this->record->procurement_id . ' was locked by ' . Auth::user()->name
-    );
+                        'Locked Abstract of Quotation',
+                        'Abstract of Quotation ' . $this->record->procurement_id . ' was locked by ' . Auth::user()->name
+                    );
 
 
 
@@ -1444,7 +2134,7 @@ protected function getFirstMissingRequirement(): ?array
         }
         
         return $formData;
-        }
+    }
 
     public function getFooter(): ?\Illuminate\Contracts\View\View
     {

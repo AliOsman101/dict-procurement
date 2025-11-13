@@ -1,4 +1,5 @@
 <?php
+
 namespace App\Filament\Resources\ProcurementResource\Pages;
 
 use App\Filament\Resources\ProcurementResource;
@@ -31,98 +32,124 @@ class ViewBac extends ViewRecord
         return "BAC Resolution No. " . ($this->record->procurement_id ?? 'N/A');
     }
 
+    // Check if the BAC currently Locked?
+    protected function isLocked(): bool
+    {
+        return $this->record->status === 'Locked';
+    }
+
+    // Check if **all** approvers in the BAC module approved?
+
+    protected function isFullyApproved(): bool
+    {
+        $approvals = $this->record->approvals()
+            ->where('module', 'bac_resolution_recommending_award')
+            ->get();
+
+        return $approvals->isNotEmpty()
+            && $approvals->every(fn ($a) => $a->status === 'Approved');
+    }
+
     // Check if AOQ is approved
     protected function hasAoqApproved(): bool
     {
-        if (!$this->record->parent_id) {
+        if (! $this->record->parent_id) {
             return false;
         }
 
         $parent = Procurement::find($this->record->parent_id);
-        
-        if (!$parent) {
+        if (! $parent) {
             return false;
         }
 
-        $aoqChild = $parent->children()->where('module', 'abstract_of_quotation')->first();
-        
-        if ($aoqChild) {
-            $approvals = $aoqChild->approvals()->where('module', 'abstract_of_quotation')->get();
-            
-            if ($approvals->isEmpty()) {
-                return false;
-            }
-            
-            return $approvals->every(fn ($approval) => $approval->status === 'Approved');
+        $aoqChild = $parent->children()
+            ->where('module', 'abstract_of_quotation')
+            ->first();
+
+        if (! $aoqChild) {
+            return false;
         }
 
-        return false;
+        $approvals = $aoqChild->approvals()
+            ->where('module', 'abstract_of_quotation')
+            ->get();
+
+        return $approvals->isNotEmpty()
+            && $approvals->every(fn ($approval) => $approval->status === 'Approved');
     }
 
-    // Get the first missing requirement in the procurement chain
+
     protected function getFirstMissingRequirement(): ?array
     {
-        if (!$this->record->parent_id) {
+        if (! $this->record->parent_id) {
             return null;
         }
 
         $parent = Procurement::find($this->record->parent_id);
-        if (!$parent) return null;
+        if (! $parent) {
+            return null;
+        }
 
         // 1. Check PPMP
         $ppmpChild = $parent->children()->where('module', 'ppmp')->first();
-        if (!$ppmpChild || !$ppmpChild->documents()->where('module', 'ppmp')->exists()) {
+        if (! $ppmpChild || ! $ppmpChild->documents()->where('module', 'ppmp')->exists()) {
             return [
-                'title' => 'PPMP Required',
-                'message' => 'You must upload a <strong class="text-danger-600 dark:text-danger-400 font-semibold">PPMP document</strong> first before proceeding with this BAC Resolution.',
-                'url' => route('filament.admin.resources.procurements.view-ppmp', $parent->id),
-                'buttonLabel' => 'Go to PPMP'
+                'title'       => 'PPMP Required',
+                'message'     => 'You must upload a <strong class="text-danger-600 dark:text-danger-400 font-semibold">PPMP document</strong> first before proceeding with this BAC Resolution.',
+                'url'         => route('filament.admin.resources.procurements.view-ppmp', $parent->id),
+                'buttonLabel' => 'Go to PPMP',
             ];
         }
 
         // 2. Check PR Approved
         $prChild = $parent->children()->where('module', 'purchase_request')->first();
-        if (!$prChild || $prChild->status !== 'Approved') {
+        if (! $prChild || $prChild->status !== 'Approved') {
             return [
-                'title' => 'PR Approval Required',
-                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Purchase Request must be approved</strong> first before proceeding with this BAC Resolution.',
-                'url' => route('filament.admin.resources.procurements.view-pr', $parent->id),
-                'buttonLabel' => 'Go to PR'
+                'title'       => 'PR Approval Required',
+                'message'     => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Purchase Request must be approved</strong> first before proceeding with this BAC Resolution.',
+                'url'         => route('filament.admin.resources.procurements.view-pr', $parent->id),
+                'buttonLabel' => 'Go to PR',
             ];
         }
 
         // 3. Check RFQ Approved
         $rfqChild = $parent->children()->where('module', 'request_for_quotation')->first();
         if ($rfqChild) {
-            $approvals = $rfqChild->approvals()->where('module', 'request_for_quotation')->get();
-            if ($approvals->isEmpty() || !$approvals->every(fn ($approval) => $approval->status === 'Approved')) {
+            $approvals = $rfqChild->approvals()
+                ->where('module', 'request_for_quotation')
+                ->get();
+
+            if ($approvals->isEmpty() || ! $approvals->every(fn ($a) => $a->status === 'Approved')) {
                 return [
-                    'title' => 'RFQ Approval Required',
-                    'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation (RFQ)</strong> must be approved first before proceeding with this BAC Resolution.',
-                    'url' => route('filament.admin.resources.procurements.view-rfq', $parent->id),
-                    'buttonLabel' => 'Go to RFQ'
+                    'title'       => 'RFQ Approval Required',
+                    'message'     => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Request for Quotation (RFQ)</strong> must be approved first before proceeding with this BAC Resolution.',
+                    'url'         => route('filament.admin.resources.procurements.view-rfq', $parent->id),
+                    'buttonLabel' => 'Go to RFQ',
                 ];
             }
         }
 
         // 4. Check AOQ Approved
         $aoqChild = $parent->children()->where('module', 'abstract_of_quotation')->first();
-        if (!$aoqChild) {
+        if (! $aoqChild) {
             return [
-                'title' => 'AOQ Not Found',
-                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Abstract of Quotation</strong> has not been created yet.',
-                'url' => route('filament.admin.resources.procurements.view', $parent->id),
-                'buttonLabel' => 'Go to Procurement'
+                'title'       => 'AOQ Not Found',
+                'message'     => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Abstract of Quotation</strong> has not been created yet.',
+                'url'         => route('filament.admin.resources.procurements.view', $parent->id),
+                'buttonLabel' => 'Go to Procurement',
             ];
         }
 
-        $approvals = $aoqChild->approvals()->where('module', 'abstract_of_quotation')->get();
-        if ($approvals->isEmpty() || !$approvals->every(fn ($approval) => $approval->status === 'Approved')) {
+        $approvals = $aoqChild->approvals()
+            ->where('module', 'abstract_of_quotation')
+            ->get();
+
+        if ($approvals->isEmpty() || ! $approvals->every(fn ($a) => $a->status === 'Approved')) {
             return [
-                'title' => 'AOQ Approval Required',
-                'message' => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Abstract of Quotation (AOQ)</strong> must be approved first before proceeding with this BAC Resolution.',
-                'url' => route('filament.admin.resources.procurements.view-aoq', $parent->id),
-                'buttonLabel' => 'Go to AOQ'
+                'title'       => 'AOQ Approval Required',
+                'message'     => 'The <strong class="text-danger-600 dark:text-danger-400 font-semibold">Abstract of Quotation (AOQ)</strong> must be approved first before proceeding with this BAC Resolution.',
+                'url'         => route('filament.admin.resources.procurements.view-aoq', $parent->id),
+                'buttonLabel' => 'Go to AOQ',
             ];
         }
 
@@ -140,21 +167,29 @@ class ViewBac extends ViewRecord
                         TextEntry::make('status')
                             ->badge()
                             ->color(fn (string $state): string => match ($state) {
-                                'Pending' => 'warning',
+                                'Pending'  => 'warning',
                                 'Approved' => 'success',
-                                'Locked' => 'danger',
+                                'Locked'   => 'danger',
                                 'Rejected' => 'danger',
-                                default => 'gray',
+                                default    => 'gray',
                             })
                             ->getStateUsing(function ($record) {
-                                $approvals = $record->approvals()->where('module', 'bac_resolution_recommending_award')->get();
+                                $approvals = $record->approvals()
+                                    ->where('module', 'bac_resolution_recommending_award')
+                                    ->get();
+
                                 if ($approvals->isEmpty()) {
                                     return 'Pending';
-                                } elseif ($approvals->contains('status', 'Rejected')) {
+                                }
+
+                                if ($approvals->contains('status', 'Rejected')) {
                                     return 'Rejected';
-                                } elseif ($approvals->every(fn ($approval) => $approval->status === 'Approved')) {
+                                }
+
+                                if ($approvals->every(fn ($a) => $a->status === 'Approved')) {
                                     return 'Approved';
                                 }
+
                                 return $record->status;
                             }),
                         TextEntry::make('created_at')
@@ -165,7 +200,7 @@ class ViewBac extends ViewRecord
                             ->label('Requested By')
                             ->getStateUsing(function ($record) {
                                 $parent = $record->parent;
-                                $pr = $parent ? $parent->children()->where('module', 'purchase_request')->first() : null;
+                                $pr     = $parent?->children()->where('module', 'purchase_request')->first();
                                 return $pr && $pr->requester ? $pr->requester->full_name : 'Not set';
                             }),
                         TextEntry::make('procurement_type')
@@ -178,6 +213,7 @@ class ViewBac extends ViewRecord
                             ->label('Category'),
                     ])
                     ->columns(4),
+
                 Section::make('Approval Stages')
                     ->schema([
                         \Filament\Infolists\Components\Grid::make(5)
@@ -199,35 +235,36 @@ class ViewBac extends ViewRecord
                                     ->state('Date Approved'),
                             ])
                             ->extraAttributes(['class' => 'bg-gray-100 dark:bg-gray-800 border-b']),
+
                         RepeatableEntry::make('approvals')
                             ->label('')
                             ->schema([
                                 TextEntry::make('procurement.procurement_id')->label(''),
-                                TextEntry::make('employee.full_name')->label('')->default('N/A'),
-                                TextEntry::make('sequence')->label('')->alignCenter(),
+                                TextEntry::make('employee.full_name')
+                                    ->label('')
+                                    ->default('N/A'),
+                                TextEntry::make('sequence')
+                                    ->label('')
+                                    ->alignCenter(),
                                 TextEntry::make('status')
                                     ->label('')
-                                    ->formatStateUsing(function ($state) {
-                                        return sprintf(
-                                            '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
-                                            match ($state) {
-                                                'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
-                                                'Pending' => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
-                                                'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
-                                                default => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
-                                            },
-                                            $state
-                                        );
-                                    })
+                                    ->formatStateUsing(fn ($state) => sprintf(
+                                        '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
+                                        match ($state) {
+                                            'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
+                                            'Pending'  => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
+                                            'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
+                                            default    => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
+                                        },
+                                        $state
+                                    ))
                                     ->html(),
                                 TextEntry::make('date_approved')
                                     ->label('')
-                                    ->state(function ($record) {
-                                        return $record->date_approved ?? 'N/A';
-                                    })
-                                    ->formatStateUsing(function ($state) {
-                                        return $state !== 'N/A' ? \Carbon\Carbon::parse($state)->format('Y-m-d') : 'N/A';
-                                    }),
+                                    ->state(fn ($record) => $record->date_approved ?? 'N/A')
+                                    ->formatStateUsing(fn ($state) => $state !== 'N/A'
+                                        ? \Carbon\Carbon::parse($state)->format('Y-m-d')
+                                        : 'N/A'),
                             ])
                             ->columns(5)
                             ->getStateUsing(function ($record) {
@@ -236,12 +273,16 @@ class ViewBac extends ViewRecord
                                     ->with('employee')
                                     ->orderBy('sequence')
                                     ->get();
+
                                 return $approvals->isEmpty() ? collect() : $approvals;
                             }),
+
                         TextEntry::make('no_approvers')
                             ->label('')
                             ->default('No approvers assigned.')
-                            ->hidden(fn ($record) => $record->approvals()->where('module', 'bac_resolution_recommending_award')->count() > 0),
+                            ->hidden(fn ($record) => $record->approvals()
+                                ->where('module', 'bac_resolution_recommending_award')
+                                ->count() > 0),
                     ]),
             ]);
     }
@@ -249,7 +290,7 @@ class ViewBac extends ViewRecord
     protected function getHeaderActions(): array
     {
         $hasAoqApproved = $this->hasAoqApproved();
-        
+
         // Always show View PDF action
         $viewPdf = Actions\Action::make('viewPdf')
             ->label('View PDF')
@@ -258,12 +299,12 @@ class ViewBac extends ViewRecord
             ->color('info')
             ->disabled(fn () => !$hasAoqApproved)
             ->tooltip(fn () => !$hasAoqApproved ? 'AOQ must be approved first' : null);
-        
+
         // If AOQ is not approved, only show the PDF action (disabled) and the warning modal action
         if (!$hasAoqApproved) {
             $aoqWarning = Actions\Action::make('aoqWarning')
                 ->label('')
-                ->modalHeading('⚠️ AOQ Approval Required')
+                ->modalHeading('AOQ Approval Required')
                 ->modalDescription('The Abstract of Quotation (AOQ) must be approved first before you can manage this BAC Resolution.')
                 ->modalSubmitAction(false)
                 ->modalCancelActionLabel('Go to AOQ')
@@ -280,13 +321,12 @@ class ViewBac extends ViewRecord
                 ->modalCancelAction(false)
                 ->closeModalByClickingAway(false)
                 ->extraAttributes(['style' => 'display: none;']);
-            
+
             return [$aoqWarning, $viewPdf];
         }
-        
+
         // Original actions if AOQ is approved
-        $isLocked = $this->record->status === 'Locked';
-        
+
         $lockAction = Actions\Action::make('lock')
             ->label('Lock')
             ->icon('heroicon-o-lock-closed')
@@ -297,14 +337,14 @@ class ViewBac extends ViewRecord
             ->action(function () {
                 $this->record->update(['status' => 'Locked']);
                 $this->record->refresh();
+ 
+                //  Log to Activity / History
+                ActivityLogger::log(
+                    'Locked BAC Resolution',
+                    'BAC Resolution ' . $this->record->procurement_id . ' was locked by ' . Auth::user()->name
+                );
 
-                // 🧾 Log to Activity / History
-    ActivityLogger::log(
-        'Locked BAC Resolution',
-        'BAC Resolution ' . $this->record->procurement_id . ' was locked by ' . Auth::user()->name
-    );
-
-                // 📧 Send Gmail notification to all approvers
+                // Send Gmail notification to all approvers
                 $approvers = $this->record->approvals()
                     ->where('module', 'bac_resolution_recommending_award')
                     ->with('employee.user')
@@ -328,8 +368,8 @@ class ViewBac extends ViewRecord
                     ->success()
                     ->send();
             })
-            ->visible(fn () => !$isLocked);
-        
+            ->visible(fn () => ! $this->isLocked() && ! $this->isFullyApproved());
+
         return [$viewPdf, $lockAction];
     }
 

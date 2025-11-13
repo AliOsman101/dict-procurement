@@ -125,52 +125,44 @@ class ViewRfq extends ViewRecord
             ->schema([
                 Section::make('Request for Quotation Details')
                     ->schema([
-                        TextEntry::make('procurement_id')
-                            ->label('RFQ No.'),
+                        TextEntry::make('procurement_id')->label('RFQ No.'),
                         TextEntry::make('status')
                             ->badge()
-                            ->color(fn (string $state): string => match ($state) {
+                            ->color(fn ($state) => match ($state) {
                                 'Pending' => 'warning',
                                 'Approved' => 'success',
                                 'Locked' => 'danger',
                                 'Rejected' => 'danger',
                                 default => 'gray',
                             }),
-                        TextEntry::make('created_at')
-                            ->label('Date Filed')
-                            ->date('Y-m-d'),
+                        TextEntry::make('created_at')->label('Date Filed')->date('Y-m-d'),
                         TextEntry::make('title'),
                         TextEntry::make('requested_by')
                             ->label('Requested By')
-                            ->getStateUsing(function ($record) {
-                                $parent = $record->parent;
-                                $pr = $parent ? $parent->children()->where('module', 'purchase_request')->first() : null;
-                                return $pr && $pr->requester ? $pr->requester->full_name : 'Not set';
-                            }),
+                            ->getStateUsing(fn ($record) =>
+                                $record->parent
+                                    ?->children()
+                                    ->where('module', 'purchase_request')
+                                    ->first()
+                                    ?->requester
+                                    ?->full_name ?? 'Not set'
+                            ),
                         TextEntry::make('procurement_type')
                             ->badge()
                             ->formatStateUsing(fn ($state) => ucwords(str_replace('_', ' ', $state)))
                             ->color(fn ($state) => $state === 'small_value_procurement' ? 'info' : 'primary'),
-                        TextEntry::make('fundCluster.name')
-                            ->label('Fund Cluster')
-                            ->default('Not set'),
-                        TextEntry::make('category.name')
-                            ->label('Category')
-                            ->default('Not set'),
+                        TextEntry::make('fundCluster.name')->label('Fund Cluster')->default('Not set'),
+                        TextEntry::make('category.name')->label('Category')->default('Not set'),
                         TextEntry::make('delivery_period_display')
                             ->label('Delivery Period')
-                            ->state(function ($record) {
-                                if ($record->delivery_mode === 'days' && $record->delivery_value) {
-                                    return "Within {$record->delivery_value} calendar days upon receipt of Purchase Order";
-                                }
-                                if ($record->delivery_mode === 'date' && $record->delivery_value) {
-                                    return Carbon::parse($record->delivery_value)->format('F j, Y');
-                                }
-                                return 'Not set';
+                            ->state(fn ($record) => match (true) {
+                                $record->delivery_mode === 'days' && $record->delivery_value => "Within {$record->delivery_value} calendar days upon receipt of Purchase Order",
+                                $record->delivery_mode === 'date' && $record->delivery_value => Carbon::parse($record->delivery_value)->format('F j, Y'),
+                                default => 'Not set',
                             }),
                         TextEntry::make('deadline_date')
                             ->label('Submission Deadline')
-                            ->formatStateUsing(fn ($state) => $state instanceof \Carbon\Carbon ? $state->format('F j, Y, g:i A') : 'Not set'),
+                            ->formatStateUsing(fn ($state) => $state ? Carbon::parse($state)->format('F j, Y, g:i A') : 'Not set'),
                     ])
                     ->columns(4)
                     ->collapsible(),
@@ -178,77 +170,51 @@ class ViewRfq extends ViewRecord
                     ->schema([
                         \Filament\Infolists\Components\Grid::make(5)
                             ->schema([
-                                TextEntry::make('hdr_procurement_id')
-                                    ->label('')
-                                    ->state('Procurement ID'),
-                                TextEntry::make('hdr_approver')
-                                    ->label('')
-                                    ->state('Approver'),
-                                TextEntry::make('hdr_designation')
-                                    ->label('')
-                                    ->state('Designation'),
-                                TextEntry::make('hdr_status')
-                                    ->label('')
-                                    ->state('Status'),
-                                TextEntry::make('hdr_remarks')
-                                    ->label('')
-                                    ->state('Remarks'),
+                                TextEntry::make('hdr_procurement_id')->label('')->state('Procurement ID'),
+                                TextEntry::make('hdr_approver')->label('')->state('Approver'),
+                                TextEntry::make('hdr_designation')->label('')->state('Designation'),
+                                TextEntry::make('hdr_status')->label('')->state('Status'),
+                                TextEntry::make('hdr_date_approved')->label('')->state('Date Approved'), // ← CHANGED
                             ])
                             ->extraAttributes(['class' => 'bg-gray-100 dark:bg-gray-800 border-b']),
-                        RepeatableEntry::make('approvals')
+
+                        \Filament\Infolists\Components\RepeatableEntry::make('approvals')
                             ->label('')
                             ->schema([
-                                TextEntry::make('procurement.procurement_id')
-                                    ->label('')
-                                    ->default('Not set'),
-                                TextEntry::make('employee.full_name')
-                                    ->label('')
-                                    ->default('Not set'),
+                                TextEntry::make('procurement.procurement_id')->label('')->default('Not set'),
+                                TextEntry::make('employee.full_name')->label('')->default('Not set'),
                                 TextEntry::make('designation')
                                     ->label('')
-                                    ->formatStateUsing(function ($state, $record) {
-                                        if ($record->module === 'request_for_quotation' && $record->procurement->office_section) {
-                                            $section = str_replace('DICT CAR - ', '', $record->procurement->office_section);
-                                            $abbr = $section === 'Admin and Finance Division' ? 'AFD' : 'TOD';
-                                            return $state ? "{$state} ({$abbr})" : 'Not set';
-                                        }
-                                        return $state ?? 'Not set';
-                                    })
+                                    ->formatStateUsing(fn ($state, $record) => $record->module === 'request_for_quotation' && $record->procurement->office_section
+                                        ? ($state ? "{$state} (" . ($record->procurement->office_section === 'DICT CAR - Admin and Finance Division' ? 'AFD' : 'TOD') . ")" : 'Not set')
+                                        : ($state ?? 'Not set')
+                                    )
                                     ->default('Not set'),
                                 TextEntry::make('status')
                                     ->label('')
-                                    ->formatStateUsing(function ($state) {
-                                        return sprintf(
-                                            '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
-                                            match ($state) {
-                                                'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
-                                                'Pending' => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
-                                                'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
-                                                default => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
-                                            },
-                                            $state
-                                        );
-                                    })
-                                    ->html(),
-                                TextEntry::make('remarks')
+                                    ->html()
+                                    ->formatStateUsing(fn ($state) => sprintf(
+                                        '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
+                                        match ($state) {
+                                            'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
+                                            'Pending' => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
+                                            'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
+                                            default => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
+                                        },
+                                        $state
+                                    )),
+                                TextEntry::make('date_approved')
                                     ->label('')
-                                    ->default('N/A'),
+                                    ->default('N/A')
+                                    ->formatStateUsing(fn ($state) => $state ? Carbon::parse($state)->format('Y-m-d') : 'N/A'),
                             ])
                             ->columns(5)
-                            ->getStateUsing(function ($record) {
-                                $approver = DefaultApprover::where('module', 'request_for_quotation')
-                                    ->where('office_section', $record->office_section)
-                                    ->first();
-                                if (!$approver) {
-                                    return collect();
-                                }
-                                $approval = $record->approvals()
-                                    ->where('module', 'request_for_quotation')
-                                    ->where('employee_id', $approver->employee_id)
-                                    ->with('employee')
-                                    ->first();
-                                return $approval ? collect([$approval]) : collect();
-                            }),
+                            ->getStateUsing(fn ($record) => $record->approvals()
+                                ->where('module', 'request_for_quotation')
+                                ->with('employee')
+                                ->orderBy('sequence')
+                                ->get()
+                            ),
                         TextEntry::make('no_approvers')
                             ->label('')
                             ->default('No approvers assigned.')
