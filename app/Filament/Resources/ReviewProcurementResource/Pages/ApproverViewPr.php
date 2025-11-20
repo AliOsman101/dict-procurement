@@ -1,0 +1,322 @@
+<?php
+
+namespace App\Filament\Resources\ReviewProcurementResource\Pages;
+
+use App\Filament\Resources\ReviewProcurementResource;
+use Filament\Resources\Pages\ViewRecord;
+use Filament\Infolists\Infolist;
+use Filament\Infolists\Components\Section;
+use Filament\Infolists\Components\TextEntry;
+use Filament\Infolists\Components\RepeatableEntry;
+use Filament\Infolists\Components\Grid;
+use Filament\Actions;
+use Filament\Notifications\Notification;
+use Illuminate\Support\Facades\Auth;
+use App\Models\Procurement;
+use App\Helpers\ActivityLogger;
+use Carbon\Carbon;
+
+class ApproverViewPr extends ViewRecord
+{
+    protected static string $resource = ReviewProcurementResource::class;
+
+    public function mount($record): void
+    {
+        $child = Procurement::where('parent_id', $record)
+                            ->where('module', 'purchase_request')
+                            ->firstOrFail();
+        $this->record = $child;
+        $this->record->refresh();
+        $this->record->load('approvals.employee');
+    }
+
+    public function getTitle(): string
+    {
+        return "PR No. " . ($this->record->procurement_id ?? 'N/A');
+    }
+
+    public function infolist(Infolist $infolist): Infolist
+    {
+        // Get rejection info (only if status is Rejected)
+        $rejectionApproval = null;
+        if ($this->record->status === 'Rejected') {
+            $rejectionApproval = $this->record->approvals()
+                ->where('module', 'purchase_request')
+                ->where('status', 'Rejected')
+                ->with('employee')
+                ->orderBy('action_at', 'desc')
+                ->first();
+        }
+
+        $schema = [];
+
+        if ($rejectionApproval) {
+            $schema[] = Section::make('PR Rejected')
+                ->schema([
+                    TextEntry::make('rejection_remarks')
+                        ->label('Rejection Remarks')
+                        ->state($rejectionApproval->remarks ?? 'No remarks provided')
+                        ->columnSpanFull(),
+                ])
+                ->columns(1)
+                ->extraAttributes(['class' => 'bg-red-50 dark:bg-red-900/20 border-l-4 border-red-500']);
+        }
+
+        $schema[] = Section::make('Purchase Request Details')
+            ->schema([
+                TextEntry::make('procurement_id')->label('PR No.'),
+                TextEntry::make('status')
+                    ->badge()
+                    ->color(fn ($state) => match ($state) {
+                        'Pending' => 'warning',
+                        'Approved' => 'success',
+                        'Locked' => 'danger',
+                        'Rejected' => 'danger',
+                        default => 'gray',
+                    }),
+                TextEntry::make('created_at')->label('Date Filed')->date('Y-m-d'),
+                TextEntry::make('title'),
+                TextEntry::make('requester.full_name')->label('Requested By')->default('Not set'),
+                TextEntry::make('procurement_type')
+                    ->badge()
+                    ->formatStateUsing(fn ($state) => ucwords(str_replace('_', ' ', $state)))
+                    ->color(fn ($state) => $state === 'small_value_procurement' ? 'info' : 'primary'),
+                TextEntry::make('fundCluster.name')->label('Fund Cluster'),
+                TextEntry::make('category.name')->label('Category'),
+            ])
+            ->columns(4);
+
+        $schema[] = Section::make('Approval Stages')
+            ->schema([
+                Grid::make(5)
+                    ->schema([
+                        TextEntry::make('hdr_procurement_id')->label('')->state('Procurement ID'),
+                        TextEntry::make('hdr_approver')->label('')->state('Approver'),
+                        TextEntry::make('hdr_sequence')->label('')->state('Sequence'),
+                        TextEntry::make('hdr_status')->label('')->state('Status'),
+                        TextEntry::make('hdr_action_date')->label('')->state('Action Date'), // CHANGED
+                    ])
+                    ->extraAttributes(['class' => 'bg-gray-100 dark:bg-gray-800 border-b']),
+
+                RepeatableEntry::make('approvals')
+                    ->label('')
+                    ->schema([
+                        TextEntry::make('procurement.procurement_id')->label(''),
+                        TextEntry::make('employee.full_name')->label('')->default('N/A'),
+                        TextEntry::make('sequence')->label('')->alignCenter(),
+                        TextEntry::make('status')
+                            ->label('')
+                            ->html()
+                            ->formatStateUsing(fn ($state) => sprintf(
+                                '<span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium %s">%s</span>',
+                                match ($state) {
+                                    'Approved' => 'bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100',
+                                    'Pending' => 'bg-yellow-100 text-yellow-800 dark:bg-yellow-800 dark:text-yellow-100',
+                                    'Rejected' => 'bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100',
+                                    default => 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-100',
+                                },
+                                $state
+                            )),
+                        TextEntry::make('action_at')
+                            ->label('')
+                            ->formatStateUsing(fn ($state) => $state ? Carbon::parse($state)->format('M d, Y') : '—')
+                            ->color(fn ($record) => $record->status === 'Rejected' ? 'danger' 
+                                                : ($record->status === 'Approved' ? 'success' : 'gray'))
+                            ->icon(fn ($record) => $record->status === 'Approved' ? 'heroicon-o-check-circle'
+                                                : ($record->status === 'Rejected' ? 'heroicon-o-x-circle' : '')),
+                    ])
+                    ->columns(5)
+                    ->getStateUsing(fn ($record) => $record->approvals()
+                        ->where('module', 'purchase_request')
+                        ->with('employee')
+                        ->orderBy('sequence')
+                        ->get()
+                    ),
+
+                TextEntry::make('no_approvers')
+                    ->label('')
+                    ->default('No approvers assigned.')
+                    ->hidden(fn ($record) => $record->approvals()->where('module', 'purchase_request')->count() > 0),
+            ]);
+
+        $schema[] = Section::make(fn ($record) => $record->basis === 'lot' ? 'Lot Details' : 'Item Details')
+            ->schema([
+                RepeatableEntry::make('items')
+                    ->label('')
+                    ->schema([
+                        TextEntry::make('sort')->label(fn ($record) => $record->procurement->basis === 'lot' ? 'Lot No.' : 'Item No.'),
+                        TextEntry::make('unit')->label('Unit'),
+                        TextEntry::make('item_description')->label(fn ($record) => $record->procurement->basis === 'lot' ? 'Lot Description' : 'Item Description'),
+                        TextEntry::make('quantity')->label('Qty'),
+                        TextEntry::make('unit_cost')->label('Unit Cost')->money('PHP'),
+                        TextEntry::make('total_cost')->label('Total Cost')->money('PHP'),
+                    ])
+                    ->columns(6)
+                    ->columnSpanFull(),
+                TextEntry::make('grand_total')
+                    ->label('Grand Total')
+                    ->money('PHP')
+                    ->extraAttributes(['class' => 'font-bold text-lg text-right mt-2']),
+            ])
+            ->collapsible()
+            ->columnSpanFull();
+
+        return $infolist->schema($schema);
+    }
+
+    protected function getHeaderActions(): array
+    {
+        $employeeId = Auth::user()->employee->id ?? null;
+        $isRejected = $this->record->status === 'Rejected';
+        $isAssigned = $employeeId && $this->record->approvals()
+            ->where('employee_id', $employeeId)
+            ->where('status', 'Pending')
+            ->exists();
+
+        $canAct = $this->record->status === 'Locked' && $isAssigned && !$isRejected;
+
+        if ($canAct) {
+            $currentApproval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
+
+            if ($currentApproval) {
+                $hasPreviousPending = $this->record->approvals()
+                    ->where('module', 'purchase_request')
+                    ->where('sequence', '<', $currentApproval->sequence)
+                    ->where('status', 'Pending')
+                    ->exists();
+                $hasRejection = $this->record->approvals()
+                    ->where('module', 'purchase_request')
+                    ->where('status', 'Rejected')
+                    ->exists();
+                $canAct = !$hasPreviousPending && !$hasRejection;
+            } else {
+                $canAct = false;
+            }
+        }
+
+        $actions = [
+            Actions\Action::make('viewPdf')
+                ->label('View PDF')
+                ->icon('heroicon-o-document-text')
+                ->url(fn () => route('procurements.pr.pdf', $this->record), true)
+                ->color('info'),
+        ];
+
+        if ($canAct) {
+            $actions[] = Actions\Action::make('approve')
+                ->label('Approve')
+                ->icon('heroicon-o-check')
+                ->color('success')
+                ->requiresConfirmation()
+                ->action(function () use ($employeeId) {
+                    $approval = $this->record->approvals()
+                        ->where('employee_id', $employeeId)
+                        ->where('status', 'Pending')
+                        ->first();
+
+                    if ($approval) {
+                        $approval->update([
+                            'status' => 'Approved',
+                            'action_at' => now(),
+                            'remarks' => null,
+                        ]);
+
+                        $allApproved = $this->record->approvals()
+                            ->where('module', 'purchase_request')
+                            ->where('status', 'Pending')
+                            ->doesntExist();
+
+                        if ($allApproved) {
+                            $this->record->update(['status' => 'Approved']);
+                        }
+
+                        if ($this->record->parent_id) {
+                            $parent = Procurement::find($this->record->parent_id);
+                            if ($parent) {
+                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
+                            }
+                        }
+
+                        ActivityLogger::log(
+                            'Approved Purchase Request',
+                            "PR {$this->record->procurement_id} approved by " . Auth::user()->name
+                        );
+
+                        $this->sendStatusEmail('Approved');
+                        Notification::make()->title('PR approved')->success()->send();
+                        $this->record->refresh();
+                    }
+                });
+
+            $actions[] = Actions\Action::make('reject')
+                ->label('Reject')
+                ->icon('heroicon-o-x-mark')
+                ->color('danger')
+                ->form([
+                    \Filament\Forms\Components\Textarea::make('remarks')
+                        ->label('Remarks')
+                        ->required()
+                        ->maxLength(255),
+                ])
+                ->action(function (array $data) use ($employeeId) {
+                    $approval = $this->record->approvals()
+                        ->where('employee_id', $employeeId)
+                        ->where('status', 'Pending')
+                        ->first();
+
+                    if ($approval) {
+                        $approval->update([
+                            'status' => 'Rejected',
+                            'action_at' => now(),
+                            'remarks' => $data['remarks'],
+                        ]);
+
+                        $this->record->update(['status' => 'Rejected']);
+                        
+                        if ($this->record->parent_id) {
+                            $parent = Procurement::find($this->record->parent_id);
+                            if ($parent) {
+                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
+                            }
+                        }
+
+                        ActivityLogger::log(
+                            'Rejected Purchase Request',
+                            "PR {$this->record->procurement_id} rejected by " . Auth::user()->name . ": {$data['remarks']}"
+                        );
+
+                        $this->sendStatusEmail('Rejected', $data['remarks']);
+                        Notification::make()->title('PR rejected')->danger()->send();
+                        $this->record->refresh();
+                    }
+                });
+        }
+
+        return $actions;
+    }
+
+    private function sendStatusEmail(string $status, ?string $remarks = null): void
+    {
+        $procurement = $this->record;
+        $approver = auth()->user();
+        $employees = $procurement->employees ?? collect();
+        $creator = $procurement->creator ?? $procurement->requester ?? null;
+
+        foreach ($employees as $employee) {
+            if ($employee->email) {
+                \Mail::to($employee->email)->send(
+                    new \App\Mail\PurchaseRequestStatusMail($procurement, $status, $approver, $remarks)
+                );
+            }
+        }
+
+        if ($creator && $creator->email) {
+            \Mail::to($creator->email)->send(
+                new \App\Mail\PurchaseRequestStatusMail($procurement, $status, $approver, $remarks)
+            );
+        }
+    }
+}
