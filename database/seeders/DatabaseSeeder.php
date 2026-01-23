@@ -62,7 +62,7 @@ class DatabaseSeeder extends Seeder
         'gender'        => 'male',
         'designation'   => 'Staff',
         'division_id'   => 1,
-        'position_ id'   => 1,
+        'position_id'   => 1,
         'project_id'    => 1,
         'office'        => 'Region Office',
         'birthday'      => '1990-01-01',
