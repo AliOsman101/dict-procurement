@@ -15,6 +15,7 @@ use Illuminate\Support\Facades\Auth;
 use App\Models\Procurement;
 use App\Helpers\ActivityLogger;
 use Carbon\Carbon;
+use App\Mail\NextApproverNotificationMail;
 
 class ApproverViewPr extends ViewRecord
 {
@@ -206,96 +207,133 @@ class ApproverViewPr extends ViewRecord
         ];
 
         if ($canAct) {
-            $actions[] = Actions\Action::make('approve')
-                ->label('Approve')
-                ->icon('heroicon-o-check')
-                ->color('success')
-                ->requiresConfirmation()
-                ->action(function () use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+    // ------------------------------
+    // APPROVE ACTION (with next-approver email notification)
+    // ------------------------------
+    $actions[] = Actions\Action::make('approve')
+        ->label('Approve')
+        ->icon('heroicon-o-check')
+        ->color('success')
+        ->requiresConfirmation()
+        ->action(function () use ($employeeId) {
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Approved',
-                            'action_at' => now(),
-                            'remarks' => null,
-                        ]);
+            if ($approval) {
 
-                        $allApproved = $this->record->approvals()
-                            ->where('module', 'purchase_request')
-                            ->where('status', 'Pending')
-                            ->doesntExist();
+                // 1. Approve current approver
+                $approval->update([
+                    'status' => 'Approved',
+                    'action_at' => now(),
+                    'remarks' => null,
+                ]);
 
-                        if ($allApproved) {
-                            $this->record->update(['status' => 'Approved']);
-                        }
+                // 2. Check if all approvers approved
+                $allApproved = $this->record->approvals()
+                    ->where('module', 'purchase_request')
+                    ->where('status', 'Pending')
+                    ->doesntExist();
 
-                        if ($this->record->parent_id) {
-                            $parent = Procurement::find($this->record->parent_id);
-                            if ($parent) {
-                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
-                            }
-                        }
+                if ($allApproved) {
+                    $this->record->update(['status' => 'Approved']);
+                }
 
-                        ActivityLogger::log(
-                            'Approved Purchase Request',
-                            "PR {$this->record->procurement_id} approved by " . Auth::user()->name
-                        );
-
-                        $this->sendStatusEmail('Approved');
-                        Notification::make()->title('PR approved')->success()->send();
-                        $this->record->refresh();
+                // 3. Update parent status
+                if ($this->record->parent_id) {
+                    $parent = Procurement::find($this->record->parent_id);
+                    if ($parent) {
+                        \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
                     }
-                });
+                }
 
-            $actions[] = Actions\Action::make('reject')
-                ->label('Reject')
-                ->icon('heroicon-o-x-mark')
-                ->color('danger')
-                ->form([
-                    \Filament\Forms\Components\Textarea::make('remarks')
-                        ->label('Remarks')
-                        ->required()
-                        ->maxLength(255),
-                ])
-                ->action(function (array $data) use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+                // 4. Log approval
+                ActivityLogger::log(
+                    'Approved Purchase Request',
+                    "PR {$this->record->procurement_id} approved by " . Auth::user()->name
+                );
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Rejected',
-                            'action_at' => now(),
-                            'remarks' => $data['remarks'],
-                        ]);
+                // ---------------------------------------------------------
+                // 5. Find NEXT approver and send email notification
+                // ---------------------------------------------------------
+                $nextApproval = $this->record->approvals()
+                    ->where('module', 'purchase_request')
+                    ->where('sequence', '>', $approval->sequence)
+                    ->where('status', 'Pending')
+                    ->orderBy('sequence')
+                    ->first();
 
-                        $this->record->update(['status' => 'Rejected']);
-                        
-                        if ($this->record->parent_id) {
-                            $parent = Procurement::find($this->record->parent_id);
-                            if ($parent) {
-                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
-                            }
-                        }
-
-                        ActivityLogger::log(
-                            'Rejected Purchase Request',
-                            "PR {$this->record->procurement_id} rejected by " . Auth::user()->name . ": {$data['remarks']}"
-                        );
-
-                        $this->sendStatusEmail('Rejected', $data['remarks']);
-                        Notification::make()->title('PR rejected')->danger()->send();
-                        $this->record->refresh();
+                if ($nextApproval && $nextApproval->employee?->user?->email) {
+                    try {
+                        \Mail::to($nextApproval->employee->user->email)
+                            ->send(new \App\Mail\NextApproverNotificationMail(
+                                $this->record,
+                                $nextApproval->employee->full_name,
+                                $nextApproval->sequence
+                            ));
+                    } catch (\Exception $e) {
+                        \Log::error("Failed to send next approver email: " . $e->getMessage());
                     }
-                });
-        }
+                }
 
-        return $actions;
+                // 6. Send regular status email
+                $this->sendStatusEmail('Approved');
+
+                Notification::make()->title('PR approved')->success()->send();
+                $this->record->refresh();
+            }
+        });
+
+    // ------------------------------
+    // REJECT ACTION (unchanged)
+    // ------------------------------
+    $actions[] = Actions\Action::make('reject')
+        ->label('Reject')
+        ->icon('heroicon-o-x-mark')
+        ->color('danger')
+        ->form([
+            \Filament\Forms\Components\Textarea::make('remarks')
+                ->label('Remarks')
+                ->required()
+                ->maxLength(255),
+        ])
+        ->action(function (array $data) use ($employeeId) {
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
+
+            if ($approval) {
+                $approval->update([
+                    'status' => 'Rejected',
+                    'action_at' => now(),
+                    'remarks' => $data['remarks'],
+                ]);
+
+                $this->record->update(['status' => 'Rejected']);
+
+                if ($this->record->parent_id) {
+                    $parent = Procurement::find($this->record->parent_id);
+                    if ($parent) {
+                        \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
+                    }
+                }
+
+                ActivityLogger::log(
+                    'Rejected Purchase Request',
+                    "PR {$this->record->procurement_id} rejected by " . Auth::user()->name . ": {$data['remarks']}"
+                );
+
+                $this->sendStatusEmail('Rejected', $data['remarks']);
+                Notification::make()->title('PR rejected')->danger()->send();
+                $this->record->refresh();
+            }
+        });
+}
+
+return $actions;
+
     }
 
     private function sendStatusEmail(string $status, ?string $remarks = null): void

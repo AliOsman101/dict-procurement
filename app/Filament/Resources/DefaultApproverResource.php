@@ -12,6 +12,8 @@ use Filament\Tables\Table;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Validation\Rule;
+use Filament\Forms\Set;
+use Filament\Forms\Get;
 
 class DefaultApproverResource extends Resource
 {
@@ -42,55 +44,77 @@ class DefaultApproverResource extends Resource
                         ->toArray())
                     ->preload()
                     ->required()
-                    ->reactive()
-                  
-                    ->rules([
-                        fn ($get, $operation): \Closure => function (string $attribute, $value, \Closure $fail) use ($get, $operation) {
-                            $module = $get('module');
-                            if (!$module || !$value) {
-                                return;
+                    ->live()
+                    ->afterStateUpdated(function ($state, Set $set) {
+                        // Reset module when employee changes
+                        $set('module', null);
+                        $set('sequence', null);
+                        $set('office_section', null);
+                    }),
+
+                // Updated module select to dynamically filter out modules based on approver limits
+                    Forms\Components\Select::make('module')
+                    ->options(function ($record, Get $get) {
+                        $allModules = [
+                            'purchase_request' => 'Purchase Request',
+                            'request_for_quotation' => 'Request for Quotation',
+                            'abstract_of_quotation' => 'Abstract of Quotation',
+                            'minutes_of_opening' => 'Minutes of Opening',
+                            'bac_resolution_recommending_award' => 'BAC Resolution',
+                            'purchase_order' => 'Purchase Order',
+                        ];
+                        
+                        // Get selected employee
+                        $employeeId = $get('employee_id');
+                        
+                        // If editing an existing record, return all modules
+                        if ($record) {
+                            return $allModules;
+                        }
+                        
+                        // Define max approvers per module
+                        $moduleApproverLimits = [
+                            'purchase_request' => 2,
+                            'request_for_quotation' => 2,
+                            'abstract_of_quotation' => 5,
+                            'minutes_of_opening' => 1,
+                            'bac_resolution_recommending_award' => 1,
+                            'purchase_order' => 2,
+                        ];
+                        
+                        // Get current count of approvers per module
+                        $approverCounts = DefaultApprover::select('module')
+                            ->selectRaw('COUNT(*) as count')
+                            ->groupBy('module')
+                            ->pluck('count', 'module')
+                            ->toArray();
+                        
+                        // If employee is selected, get modules they're already assigned to
+                        $employeeAssignedModules = [];
+                        if ($employeeId) {
+                            $employeeAssignedModules = DefaultApprover::where('employee_id', $employeeId)
+                                ->pluck('module')
+                                ->toArray();
+                        }
+                        
+                        // Filter out modules
+                        return array_filter($allModules, function($key) use ($moduleApproverLimits, $approverCounts, $employeeAssignedModules) {
+                            // Hide if employee is already assigned to this module
+                            if (in_array($key, $employeeAssignedModules)) {
+                                return false;
                             }
-
-                            $query = DefaultApprover::where('employee_id', $value)
-                                ->where('module', $module);
-
-                            // Only exclude current record when editing
-                            if ($operation === 'edit' && $get('../../record.id')) {
-                                $query->where('id', '!=', $get('../../record.id'));
-                            }
-
-                            $exists = $query->exists();
-
-                            if ($exists) {
-                                $employee = Employee::find($value);
-                                $name = $employee?->full_name ?? 'This employee';
-
-                                $moduleNames = [
-                                    'purchase_request' => 'Purchase Request',
-                                    'request_for_quotation' => 'Request for Quotation',
-                                    'abstract_of_quotation' => 'Abstract of Quotation',
-                                    'bac_resolution_recommending_award' => 'BAC Resolution',
-                                    'purchase_order' => 'Purchase Order',
-                                ];
-
-                                $moduleName = $moduleNames[$module] ?? ucwords(str_replace('_', ' ', $module));
-
-                                $fail("{$name} is already assigned as approver for {$moduleName}.");
-                            }
-                        },
-                    ]),
-
-                // Removed PPMP from module options
-                Forms\Components\Select::make('module')
-                    ->options([
-                        'purchase_request' => 'Purchase Request',
-                        'request_for_quotation' => 'Request for Quotation',
-                        'abstract_of_quotation' => 'Abstract of Quotation',
-                        'bac_resolution_recommending_award' => 'BAC Resolution',
-                        'purchase_order' => 'Purchase Order',
-                    ])
+                            
+                            // Hide if module has reached its limit
+                            $limit = $moduleApproverLimits[$key] ?? 2;
+                            $currentCount = $approverCounts[$key] ?? 0;
+                            return $currentCount < $limit;
+                        }, ARRAY_FILTER_USE_KEY);
+                    })
                     ->required()
-                    ->reactive()
+                    ->live()
+                    ->helperText(fn (Get $get) => $get('employee_id') 
+                        ? 'Only modules where this employee is not yet assigned are shown.' 
+                        : 'Please select an employee first.')
                     ->afterStateUpdated(function (callable $set, $state) {
                         if ($state === 'request_for_quotation') {
                             $set('sequence', 1);
@@ -104,24 +128,33 @@ class DefaultApproverResource extends Resource
                     }),
 
                 Forms\Components\Select::make('office_section')
-                    ->options([
-                        'DICT CAR - Admin and Finance Division' => 'Admin and Finance Division',
-                        'DICT CAR - Technical Operations Division' => 'Technical Operations Division',
-                    ])
+                    ->options(function ($record) {
+                        $allSections = [
+                            'DICT CAR - Admin and Finance Division' => 'Admin and Finance Division',
+                            'DICT CAR - Technical Operations Division' => 'Technical Operations Division',
+                        ];
+                        
+                        // If editing, return all sections
+                        if ($record) {
+                            return $allSections;
+                        }
+                        
+                        // Check which sections already have approvers for RFQ module
+                        $assignedSections = DefaultApprover::where('module', 'request_for_quotation')
+                            ->pluck('office_section')
+                            ->toArray();
+                        
+                        // Filter out sections that already have an approver
+                        return array_filter($allSections, function($key) use ($assignedSections) {
+                            return !in_array($key, $assignedSections);
+                        }, ARRAY_FILTER_USE_KEY);
+                    })
                     ->visible(fn ($get) => $get('module') === 'request_for_quotation')
-                    ->reactive()
+                    ->live()
                     ->required(fn ($get) => $get('module') === 'request_for_quotation')
                     ->validationMessages([
                         'required' => 'The office section field is required when module is Request for Quotation.',
-                    ])
-                    ->unique(
-                        table: DefaultApprover::class,
-                        column: 'office_section',
-                        ignoreRecord: true,
-                        modifyRuleUsing: fn ($rule, $get) => $get('module') === 'request_for_quotation'
-                            ? $rule->where('module', 'request_for_quotation')
-                            : $rule->whereNull('module')
-                    ),
+                    ]),
 
                 Forms\Components\TextInput::make('sequence')
                     ->label('Approval Sequence')
@@ -129,7 +162,91 @@ class DefaultApproverResource extends Resource
                     ->required(fn ($get) => $get('module') !== 'request_for_quotation')
                     ->minValue(1)
                     ->default(fn ($get) => $get('module') === 'request_for_quotation' ? 1 : null)
-                    ->readOnly(fn ($get) => $get('module') === 'request_for_quotation'),
+                    ->readOnly(fn ($get) => $get('module') === 'request_for_quotation')
+                    ->live(debounce: 300)
+                    ->helperText(function (Get $get, $state, $component) {
+                        $module = $get('module');
+                        
+                        // Skip if no module or sequence
+                        if (!$module || !$state) {
+                            return null;
+                        }
+
+                        // Allow duplicates for AOQ
+                        if ($module === 'abstract_of_quotation') {
+                            return 'Duplicate sequences are allowed for Abstract of Quotation.';
+                        }
+
+                        // Check for duplicate sequence
+                        $query = DefaultApprover::where('module', $module)
+                            ->where('sequence', $state);
+
+                        // Exclude current record when editing
+                        if ($get('../../record.id')) {
+                            $query->where('id', '!=', $get('../../record.id'));
+                        }
+
+                        $exists = $query->exists();
+
+                        if ($exists) {
+                            $moduleNames = [
+                                'purchase_request' => 'Purchase Request',
+                                'request_for_quotation' => 'Request for Quotation',
+                                'minutes_of_opening' => 'Minutes of Opening',
+                                'bac_resolution_recommending_award' => 'BAC Resolution',
+                                'purchase_order' => 'Purchase Order',
+                            ];
+
+                            $moduleName = $moduleNames[$module] ?? ucwords(str_replace('_', ' ', $module));
+                            
+                            // Return error message with inline styling for red color
+                            return new \Illuminate\Support\HtmlString(
+                                '<span style="color: #ef4444;">Sequence ' . $state . ' is already assigned to another approver in ' . $moduleName . '.</span>'
+                            );
+                        }
+
+                        return 'Sequence is available.';
+                    })
+                    ->validationAttribute('sequence')
+                    ->rules([
+                        fn ($get, $operation): \Closure => function (string $attribute, $value, \Closure $fail) use ($get, $operation) {
+                            $module = $get('module');
+                            
+                            // Skip validation if no module or sequence
+                            if (!$module || !$value) {
+                                return;
+                            }
+
+                            // Allow duplicate sequences ONLY for abstract_of_quotation
+                            if ($module === 'abstract_of_quotation') {
+                                return;
+                            }
+
+                            // For all other modules, check for duplicate sequences
+                            $query = DefaultApprover::where('module', $module)
+                                ->where('sequence', $value);
+
+                            // Exclude current record when editing
+                            if ($operation === 'edit' && $get('../../record.id')) {
+                                $query->where('id', '!=', $get('../../record.id'));
+                            }
+
+                            $exists = $query->exists();
+
+                            if ($exists) {
+                                $moduleNames = [
+                                    'purchase_request' => 'Purchase Request',
+                                    'request_for_quotation' => 'Request for Quotation',
+                                    'minutes_of_opening' => 'Minutes of Opening',
+                                    'bac_resolution_recommending_award' => 'BAC Resolution',
+                                    'purchase_order' => 'Purchase Order',
+                                ];
+
+                                $moduleName = $moduleNames[$module] ?? ucwords(str_replace('_', ' ', $module));
+                                $fail("Please choose a different sequence number.");
+                            }
+                        },
+                    ]),
 
                 Forms\Components\TextInput::make('designation')
                     ->label('Designation')
@@ -153,6 +270,7 @@ class DefaultApproverResource extends Resource
                         'purchase_request' => 'Purchase Request',
                         'request_for_quotation' => 'Request for Quotation',
                         'abstract_of_quotation' => 'Abstract of Quotation',
+                        'minutes_of_opening' => 'Minutes of Opening',
                         'bac_resolution_recommending_award' => 'BAC Resolution',
                         'purchase_order' => 'Purchase Order',
                         default => ucwords(str_replace('_', ' ', $state)),
@@ -176,12 +294,12 @@ class DefaultApproverResource extends Resource
                     ->sortable(),
             ])
             ->filters([
-                // Removed PPMP from filter options
                 Tables\Filters\SelectFilter::make('module')
                     ->options([
                         'purchase_request' => 'Purchase Request',
                         'request_for_quotation' => 'Request for Quotation',
                         'abstract_of_quotation' => 'Abstract of Quotation',
+                        'minutes_of_opening' => 'Minutes of Opening',
                         'bac_resolution_recommending_award' => 'BAC Resolution',
                         'purchase_order' => 'Purchase Order',
                     ]),

@@ -2,6 +2,7 @@
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\ProcurementResource\Pages;
+use App\Filament\Resources\ProcurementResource\Pages\ViewMo;
 use App\Models\FundCluster;
 use App\Models\Category;
 use App\Models\Employee;
@@ -253,6 +254,7 @@ class ProcurementResource extends Resource
             'view-pr' => Pages\ViewPr::route('/{record}/pr'),
             'view-rfq' => Pages\ViewRfq::route('/{record}/rfq'),
             'view-aoq' => Pages\ViewAoq::route('/{record}/aoq'),
+            'view-minutes' => Pages\ViewMo::route('/{record}/minutes'),
             'view-bac' => Pages\ViewBac::route('/{record}/bac'),
             'view-po' => Pages\ViewPo::route('/{record}/po'),
         ];

@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Auth;
 use App\Models\Procurement;
 use Carbon\Carbon;
 use App\Helpers\ActivityLogger;
+use App\Mail\NextApproverNotificationMail;
 
 class ApproverViewRfq extends ViewRecord
 {
@@ -206,115 +207,178 @@ class ApproverViewRfq extends ViewRecord
         ];
 
         if ($canAct) {
-            $actions[] = Actions\Action::make('approve')
-                ->label('Approve')
-                ->icon('heroicon-o-check')
-                ->color('success')
-                ->requiresConfirmation()
-                ->action(function () use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Approved',
-                            'action_at' => now(),
-                            'remarks' => null,
-                        ]);
+    // ------------------------------
+    // APPROVE ACTION (updated)
+    // ------------------------------
+    $actions[] = Actions\Action::make('approve')
+        ->label('Approve')
+        ->icon('heroicon-o-check')
+        ->color('success')
+        ->requiresConfirmation()
+        ->action(function () use ($employeeId) {
 
-                        $allApproved = $this->record->approvals()
-                            ->where('module', 'request_for_quotation')
-                            ->where('status', 'Pending')
-                            ->doesntExist();
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
 
-                        if ($allApproved) {
-                            $this->record->update(['status' => 'Approved']);
-                        }
+            if ($approval) {
 
-                        if ($this->record->parent_id) {
-                            $parent = Procurement::find($this->record->parent_id);
-                            if ($parent) {
-                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
-                            }
-                        }
+                // 1. Approve current approver
+                $approval->update([
+                    'status' => 'Approved',
+                    'action_at' => now(),
+                    'remarks' => null,
+                ]);
 
-                        ActivityLogger::log(
-                            'Approved Request for Quotation',
-                            "RFQ {$this->record->procurement_id} approved by " . auth()->user()->name
-                        );
+                // 2. Check if RFQ is fully approved
+                $allApproved = $this->record->approvals()
+                    ->where('module', 'request_for_quotation')
+                    ->where('status', 'Pending')
+                    ->doesntExist();
 
-                        // 🔔 Send Gmail notifications
-                        $procurement = $this->record;
-                        $approver = auth()->user();
-                        $employees = $procurement->employees ?? collect();
-                        $creator = $procurement->creator ?? $procurement->requester ?? $procurement->parent?->requester ?? null;
+                if ($allApproved) {
+                    $this->record->update(['status' => 'Approved']);
+                }
 
-                        foreach ($employees as $employee) {
-                            if ($employee->email) {
-                                \Mail::to($employee->email)->send(
-                                    new \App\Mail\RequestForQuotationStatusMail($procurement, 'Approved', $approver)
-                                );
-                            }
-                        }
-
-                        if ($creator && $creator->email) {
-                            \Mail::to($creator->email)->send(
-                                new \App\Mail\RequestForQuotationStatusMail($procurement, 'Approved', $approver)
-                            );
-                        }
-
-                        Notification::make()->title('RFQ approved')->success()->send();
-                        $this->record->refresh();
+                // 3. Update parent
+                if ($this->record->parent_id) {
+                    $parent = Procurement::find($this->record->parent_id);
+                    if ($parent) {
+                        \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
                     }
-                });
+                }
 
-            $actions[] = Actions\Action::make('reject')
-                ->label('Reject')
-                ->icon('heroicon-o-x-mark')
-                ->color('danger')
-                ->form([
-                    \Filament\Forms\Components\Textarea::make('remarks')
-                        ->label('Remarks')
-                        ->required()
-                        ->maxLength(255),
-                ])
-                ->action(function (array $data) use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+                // 4. Log approval
+                ActivityLogger::log(
+                    'Approved Request for Quotation',
+                    "RFQ {$this->record->procurement_id} approved by " . auth()->user()->name
+                );
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Rejected',
-                            'action_at' => now(),
-                            'remarks' => $data['remarks'],
-                        ]);
+                // ------------------------------------------------------
+                // 5. FIND NEXT APPROVER & SEND NOTIFICATION EMAIL
+                // ------------------------------------------------------
+                $nextApproval = $this->record->approvals()
+                    ->where('module', 'request_for_quotation')
+                    ->where('sequence', '>', $approval->sequence)
+                    ->where('status', 'Pending')
+                    ->orderBy('sequence')
+                    ->first();
 
-                        $this->record->update(['status' => 'Rejected']);
-                        
-                        if ($this->record->parent_id) {
-                            $parent = Procurement::find($this->record->parent_id);
-                            if ($parent) {
-                                \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
-                            }
-                        }
-
-                        ActivityLogger::log(
-                            'Rejected Request for Quotation',
-                            "RFQ {$this->record->procurement_id} rejected by " . auth()->user()->name . ": {$data['remarks']}"
-                        );
-
-                        $this->sendStatusEmail('Rejected', $data['remarks']);
-                        Notification::make()->title('RFQ rejected')->danger()->send();
-                        $this->record->refresh();
+                if ($nextApproval && $nextApproval->employee?->user?->email) {
+                    try {
+                        \Mail::to($nextApproval->employee->user->email)
+                            ->send(new \App\Mail\NextApproverNotificationMail(
+                                $this->record,
+                                $nextApproval->employee->full_name,
+                                $nextApproval->sequence
+                            ));
+                    } catch (\Exception $e) {
+                        \Log::error("Failed to send next approver email: " . $e->getMessage());
                     }
-                });
-        }
+                }
 
-        return $actions;
+                // ------------------------------------------------------
+                // 6. SEND YOUR ORIGINAL RFQ STATUS EMAILS
+                // ------------------------------------------------------
+                $procurement = $this->record;
+                $approver = auth()->user();
+                $employees = $procurement->employees ?? collect();
+                $creator = $procurement->creator
+                    ?? $procurement->requester
+                    ?? $procurement->parent?->requester
+                    ?? null;
+
+                foreach ($employees as $employee) {
+                    if ($employee->email) {
+                        \Mail::to($employee->email)->send(
+                            new \App\Mail\RequestForQuotationStatusMail(
+                                $procurement,
+                                'Approved',
+                                $approver
+                            )
+                        );
+                    }
+                }
+
+                if ($creator && $creator->email) {
+                    \Mail::to($creator->email)->send(
+                        new \App\Mail\RequestForQuotationStatusMail(
+                            $procurement,
+                            'Approved',
+                            $approver
+                        )
+                    );
+                }
+
+                // 7. UI notification
+                Notification::make()
+                    ->title('RFQ approved')
+                    ->success()
+                    ->send();
+
+                $this->record->refresh();
+            }
+        });
+
+    // ------------------------------
+    // REJECT ACTION (unchanged)
+    // ------------------------------
+    $actions[] = Actions\Action::make('reject')
+        ->label('Reject')
+        ->icon('heroicon-o-x-mark')
+        ->color('danger')
+        ->form([
+            \Filament\Forms\Components\Textarea::make('remarks')
+                ->label('Remarks')
+                ->required()
+                ->maxLength(255),
+        ])
+        ->action(function (array $data) use ($employeeId) {
+
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
+
+            if ($approval) {
+
+                $approval->update([
+                    'status' => 'Rejected',
+                    'action_at' => now(),
+                    'remarks' => $data['remarks'],
+                ]);
+
+                $this->record->update(['status' => 'Rejected']);
+
+                if ($this->record->parent_id) {
+                    $parent = Procurement::find($this->record->parent_id);
+                    if ($parent) {
+                        \App\Helpers\ProcurementStatusHelper::updateParentStatus($parent);
+                    }
+                }
+
+                ActivityLogger::log(
+                    'Rejected Request for Quotation',
+                    "RFQ {$this->record->procurement_id} rejected by " 
+                        . auth()->user()->name . ": {$data['remarks']}"
+                );
+
+                $this->sendStatusEmail('Rejected', $data['remarks']);
+
+                Notification::make()
+                    ->title('RFQ rejected')
+                    ->danger()
+                    ->send();
+
+                $this->record->refresh();
+            }
+        });
+}
+
+return $actions;
+
     }
 
     private function sendStatusEmail(string $status, ?string $remarks = null): void

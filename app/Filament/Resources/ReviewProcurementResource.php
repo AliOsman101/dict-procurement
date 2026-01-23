@@ -10,6 +10,7 @@ use Filament\Tables;
 use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 
 class ReviewProcurementResource extends Resource
 {
@@ -76,6 +77,7 @@ class ReviewProcurementResource extends Resource
                             'purchase_request',
                             'request_for_quotation',
                             'abstract_of_quotation',
+                            'minutes_of_opening',
                             'bac_resolution_recommending_award',
                             'purchase_order'
                         ])
@@ -85,7 +87,7 @@ class ReviewProcurementResource extends Resource
                                 ->where('status', 'Pending'); // Employee has pending approval
                         })
                         ->whereDoesntHave('approvals', function ($rejectionQuery) {
-                            $rejectionQuery->where('status', 'Rejected'); // No rejections in this module
+                            $rejectionQuery->where('status', 'Rejected');
                         })
                         ->whereHas('approvals', function ($sequenceQuery) use ($employeeId) {
                             // Get current employee's sequence
@@ -97,7 +99,7 @@ class ReviewProcurementResource extends Resource
                                         ->from('approvals as prev_approvals')
                                         ->whereColumn('prev_approvals.procurement_id', 'approvals.procurement_id')
                                         ->where('prev_approvals.status', 'Pending')
-                                        ->whereRaw('prev_approvals.sequence < (SELECT sequence FROM approvals WHERE employee_id = ? AND procurement_id = prev_approvals.procurement_id LIMIT 1)', [$employeeId]);
+                                        ->whereRaw('prev_approvals.sequence < (SELECT sequence FROM approvals WHERE employee_id = ? AND procurement_id = prev_approvals.procurement_id AND status = "Pending" LIMIT 1)', [$employeeId]);
                                 });
                         });
                     });
@@ -121,6 +123,7 @@ class ReviewProcurementResource extends Resource
             'approver-view-rfq' => Pages\ApproverViewRfq::route('/{record}/rfq'),
             'rfq-distribution' => Pages\ApproverRfqDistribution::route('/{record}/rfq-distribution'),
             'approver-view-aoq' => Pages\ApproverViewAoq::route('/{record}/aoq'),
+            'approver-view-mo'  => Pages\ApproverViewMo::route('/{record}/mo'),
             'approver-view-bac' => Pages\ApproverViewBac::route('/{record}/bac'),
             'approver-view-po' => Pages\ApproverViewPo::route('/{record}/po'),
         ];
@@ -140,20 +143,43 @@ class ReviewProcurementResource extends Resource
             return null;
         }
 
-        $query = Procurement::whereNull('module')
-            ->whereIn('status', ['Pending', 'Locked'])
-            ->whereHas('children.approvals', function ($q) use ($employeeId) {
-                $q->where('employee_id', $employeeId)
-                  ->where('status', 'Pending');
+        // Count procurements where it's the employee's turn to approve
+        $count = Procurement::whereNull('module')
+            ->whereHas('children', function ($childQuery) use ($employeeId) {
+                $childQuery->whereIn('module', [
+                    'purchase_request',
+                    'request_for_quotation',
+                    'abstract_of_quotation',
+                    'minutes_of_opening',
+                    'bac_resolution_recommending_award',
+                    'purchase_order'
+                ])
+                ->where('status', 'Locked') // Only locked/ready modules
+                ->whereHas('approvals', function ($approvalQuery) use ($employeeId) {
+                    // Employee has pending approval
+                    $approvalQuery->where('employee_id', $employeeId)
+                        ->where('status', 'Pending');
+                })
+                ->whereDoesntHave('approvals', function ($rejectionQuery) {
+                    // No rejections in this module
+                    $rejectionQuery->where('status', 'Rejected');
+                })
+                ->whereHas('approvals', function ($sequenceQuery) use ($employeeId) {
+                    // It's the employee's turn (no previous sequences are pending)
+                    $sequenceQuery->where('employee_id', $employeeId)
+                        ->where('status', 'Pending')
+                        ->whereNotExists(function ($previousPendingQuery) use ($employeeId) {
+                            $previousPendingQuery->selectRaw('1')
+                                ->from('approvals as prev_approvals')
+                                ->whereColumn('prev_approvals.procurement_id', 'approvals.procurement_id')
+                                ->where('prev_approvals.status', 'Pending')
+                                ->whereRaw('prev_approvals.sequence < (SELECT sequence FROM approvals WHERE employee_id = ? AND procurement_id = prev_approvals.procurement_id AND status = "Pending" LIMIT 1)', [$employeeId]);
+                        });
+                });
             })
-            ->whereHas('children', function ($q) {
-                $q->where('module', 'ppmp')
-                  ->whereHas('documents', function ($d) {
-                      $d->where('module', 'ppmp');
-                  });
-            });
+            ->count();
 
-        return (string) $query->count();
+        return $count > 0 ? (string) $count : null;
     }
 
     public static function getNavigationBadgeColor(): string

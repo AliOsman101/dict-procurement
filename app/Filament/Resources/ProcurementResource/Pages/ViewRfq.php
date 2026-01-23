@@ -34,6 +34,8 @@ use Filament\Forms\Components\Placeholder;
 use Filament\Support\Exceptions\Halt;
 use Filament\Actions\Concerns\CanDispatchEvents;
 use App\Helpers\ActivityLogger; 
+use App\Mail\RequestForQuotationRevisedAndLockedMail;  
+use App\Mail\RfqLockedMail; 
 
 class ViewRfq extends ViewRecord
 {
@@ -232,6 +234,7 @@ class ViewRfq extends ViewRecord
                     ->state(fn ($record) => match (true) {
                         $record->delivery_mode === 'days' && $record->delivery_value => "Within {$record->delivery_value} calendar days upon receipt of Purchase Order",
                         $record->delivery_mode === 'date' && $record->delivery_value => Carbon::parse($record->delivery_value)->format('F j, Y'),
+                        $record->delivery_mode === 'tbd' => 'To Be Determined',
                         default => 'Not set',
                     }),
                 TextEntry::make('deadline_date')
@@ -305,7 +308,7 @@ class ViewRfq extends ViewRecord
         $isLocked = $this->record->status === 'Locked';
         $isRejected = $this->record->status === 'Rejected';
         $isPending = $this->record->status === 'Pending';
-        $hasDelivery = !empty($this->record->delivery_mode) && !empty($this->record->delivery_value);
+        $hasDelivery = !empty($this->record->delivery_mode) && ($this->record->delivery_mode === 'tbd' || !empty($this->record->delivery_value));
         $hasDeadline = !empty($this->record->deadline_date);
         $isApproved = $this->record->approvals()
             ->where('module', 'request_for_quotation')
@@ -376,6 +379,7 @@ class ViewRfq extends ViewRecord
                         ->options([
                             'days' => 'Number of Days',
                             'date' => 'Specific Date',
+                            'tbd' => 'To Be Determined',
                         ])
                         ->required()
                         ->reactive(),
@@ -399,7 +403,13 @@ class ViewRfq extends ViewRecord
                     ];
                 })
                 ->action(function (array $data) {
-                    $value = $data['delivery_mode'] === 'days' ? $data['delivery_days'] : ($data['delivery_date'] ? Carbon::parse($data['delivery_date'])->toDateString() : null);
+                    $value = match($data['delivery_mode']) {
+                        'days' => $data['delivery_days'] ?? null,
+                        'date' => isset($data['delivery_date']) ? Carbon::parse($data['delivery_date'])->toDateString() : null,
+                        'tbd' => null,
+                        default => null,
+                    };
+                    
                     $this->record->update([
                         'delivery_mode' => $data['delivery_mode'],
                         'delivery_value' => $value,
@@ -411,7 +421,7 @@ class ViewRfq extends ViewRecord
             $actions[] = Actions\Action::make('setDeadline')
                 ->label('Set Submission Deadline')
                 ->icon('heroicon-o-calendar')
-                ->visible(fn () => $canEdit) // Restrict visibility to authorized users
+                ->visible(fn () => $canEdit)
                 ->form([
                     DateTimePicker::make('deadline_date')
                         ->label('Submission Deadline')
@@ -436,8 +446,7 @@ class ViewRfq extends ViewRecord
                 ->icon('heroicon-o-lock-closed')
                 ->color('danger')
                 ->requiresConfirmation()
-                ->visible(fn () => $canEdit && $hasDelivery && $hasDeadline) // Restrict visibility to authorized users and keep existing conditions
-
+                ->visible(fn () => $canEdit && $hasDelivery && $hasDeadline)
                 ->action(function () {
                     $this->record->update(['status' => 'Locked']);
 
@@ -451,24 +460,36 @@ class ViewRfq extends ViewRecord
                     $this->record->refresh();
 
                     // 🔔 Send Gmail notification to assigned approver(s)
+                    // 🔔 Notify all approvers when RFQ is locked
                     $approvers = $this->record->approvals()
                         ->where('module', 'request_for_quotation')
                         ->with('employee.user')
                         ->get();
 
+                    // Check if RFQ was previously rejected before this lock
+                    $wasRejectedBefore = $this->record->approvals()
+                        ->where('module', 'request_for_quotation')
+                        ->where('status', 'Rejected')
+                        ->exists();
+
                     foreach ($approvers as $approval) {
                         $user = $approval->employee->user ?? null;
-                        if ($user && $user->email) {
+
+                        if ($user && !empty($user->email)) {
                             try {
-                                \Mail::to($user->email)->send(
-                                    new \App\Mail\RequestForQuotationRevisedAndLockedMail($this->record)
-                                );
-                                
-                                \Mail::to($user->email)->send(
-                        new \App\Mail\RfqLockedMail($this->record)
-                    );
+                                if ($wasRejectedBefore) {
+                                    // ✔ RFQ was rejected before → send Revised Email
+                                    \Mail::to($user->email)->send(
+                                        new \App\Mail\RequestForQuotationRevisedAndLockedMail($this->record)
+                                    );
+                                } else {
+                                    // ✔ Normal RFQ Lock → send ONLY Locked Email
+                                    \Mail::to($user->email)->send(
+                                        new \App\Mail\RfqLockedMail($this->record)
+                                    );
+                                }
                             } catch (\Exception $e) {
-                                \Log::error("Failed to send RFQ locked email to {$user->email}: {$e->getMessage()}");
+                                \Log::error("Failed to send RFQ lock email to {$user->email}: {$e->getMessage()}");
                             }
                         }
                     }
@@ -480,7 +501,7 @@ class ViewRfq extends ViewRecord
                 });
         }
 
-        // DISTRIBUTE RFQ: Only when approved
+// DISTRIBUTE RFQ: Only when approved
         if ($isApproved && $hasDelivery && $hasDeadline && $hasPrApproved && !$isCompleted) {
             $actions[] = Actions\Action::make('distributeRfq')
                 ->label('Distribute RFQ')
@@ -489,13 +510,100 @@ class ViewRfq extends ViewRecord
                     return Supplier::whereHas('categories', fn ($query) => $query->where('category_id', $this->record->category_id))->count() == 0;
                 })
                 ->tooltip(fn ($action) => $action->isDisabled() ? 'No suppliers available for this category.' : null)
+                ->modalWidth('7xl')
                 ->form([
+                    Placeholder::make('select_all_buttons')
+                        ->label('')
+                        ->content(function () {
+                            $categoryId = $this->record->category_id;
+                            $totalSuppliers = Supplier::whereHas('categories', fn ($query) => $query->where('category_id', $categoryId))->count();
+                            
+                            return new \Illuminate\Support\HtmlString('
+                                <div x-data="{ 
+                                    selectedCount: 0,
+                                    totalSuppliers: ' . $totalSuppliers . ',
+                                    updateCount() {
+                                        this.$nextTick(() => {
+                                            const checkboxes = document.querySelectorAll(\'input[type=checkbox][wire\\\\:model*=\\\'suppliers\\\']\');
+                                            let count = 0;
+                                            checkboxes.forEach(cb => {
+                                                if (cb.checked) count++;
+                                            });
+                                            this.selectedCount = count;
+                                        });
+                                    },
+                                    selectAll() {
+                                        const checkboxes = document.querySelectorAll(\'input[type=checkbox][wire\\\\:model*=\\\'suppliers\\\']\');
+                                        checkboxes.forEach(cb => {
+                                            if (!cb.checked) {
+                                                cb.click();
+                                            }
+                                        });
+                                        setTimeout(() => this.updateCount(), 100);
+                                    },
+                                    deselectAll() {
+                                        const checkboxes = document.querySelectorAll(\'input[type=checkbox][wire\\\\:model*=\\\'suppliers\\\']\');
+                                        checkboxes.forEach(cb => {
+                                            if (cb.checked) {
+                                                cb.click();
+                                            }
+                                        });
+                                        setTimeout(() => this.updateCount(), 100);
+                                    }
+                                }" 
+                                x-init="
+                                    setTimeout(() => updateCount(), 500);
+                                    setInterval(() => updateCount(), 1000);
+                                "
+                                class="mb-6 p-4 bg-gradient-to-r from-gray-50 to-gray-100 dark:from-gray-800 dark:to-gray-900 rounded-lg border-2 border-gray-200 dark:border-gray-700 shadow-sm">
+                                    <div class="flex items-center justify-between gap-4">
+                                        <div class="flex items-center gap-3">
+                                            <button 
+                                                type="button"
+                                                @click="selectAll()"
+                                                class="inline-flex items-center px-4 py-2.5 bg-primary-600 hover:bg-primary-700 dark:bg-primary-500 dark:hover:bg-primary-600 text-white font-semibold text-sm rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2"
+                                            >
+                                                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                                </svg>
+                                                Select All Suppliers
+                                            </button>
+                                            
+                                            <button 
+                                                type="button"
+                                                @click="deselectAll()"
+                                                class="inline-flex items-center px-4 py-2.5 bg-gray-600 hover:bg-gray-700 dark:bg-gray-700 dark:hover:bg-gray-600 text-white font-semibold text-sm rounded-lg shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2"
+                                            >
+                                                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                                </svg>
+                                                Deselect All
+                                            </button>
+                                        </div>
+                                        
+                                        <div class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-800 rounded-lg border border-gray-300 dark:border-gray-600 shadow-sm">
+                                            <svg class="w-5 h-5 text-gray-500 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                                            </svg>
+                                            <span class="text-lg font-bold text-primary-600 dark:text-primary-400" x-text="selectedCount"></span>
+                                            <span class="text-sm text-gray-600 dark:text-gray-400">of</span>
+                                            <span class="text-lg font-bold text-gray-700 dark:text-gray-300" x-text="totalSuppliers"></span>
+                                            <span class="text-sm text-gray-600 dark:text-gray-400">selected</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            ');
+                        })
+                        ->columnSpanFull(),
                     Repeater::make('suppliers')
                         ->label('Select Suppliers and Send Method')
                         ->schema([
                             Checkbox::make('selected')
                                 ->label('Select')
-                                ->default(false),
+                                ->default(false)
+                                ->extraAttributes([
+                                    'x-on:change' => '$dispatch("checkbox-changed")'
+                                ]),
                             TextInput::make('business_name')
                                 ->label('Business Name')
                                 ->disabled()
@@ -535,12 +643,14 @@ class ViewRfq extends ViewRecord
                         })
                         ->addable(false)
                         ->deletable(false)
-                        ->reorderable(false),
+                        ->reorderable(false)
+                        ->columnSpanFull(),
                     Textarea::make('email_body')
                         ->label('Email Body (for Email/Both)')
                         ->default('Please fill and return the attached RFQ by {deadline}. The RFQ document is attached for your reference.')
                         ->rows(4)
-                        ->required(),
+                        ->required()
+                        ->columnSpanFull(),
                 ])
                 ->action(function (array $data) {
                     $suppliers = collect($data['suppliers'] ?? []);
@@ -605,7 +715,9 @@ class ViewRfq extends ViewRecord
                         if (in_array($method, ['email', 'both'])) {
                             if ($email && filter_var($email, FILTER_VALIDATE_EMAIL)) {
                                 try {
-                                    Mail::to($email)->send(new RfqMail($emailBody, $pdfPath)); // Pass processed emailBody
+                                    Mail::to($email)->send(
+                                        new RfqMail($emailBody, $pdfPath, $rfqDistribution->id)
+                        ); // Pass processed emailBody
                                     $sentTo .= $email . ' ';
                                 } catch (\Exception $e) {
                                     $sentTo .= 'Failed to send email: ' . $e->getMessage() . ' ';
@@ -652,7 +764,16 @@ class ViewRfq extends ViewRecord
             ->label('View PDF')
             ->icon('heroicon-o-document-text')
             ->url(fn () => route('procurements.rfq.pdf', $this->record->parent_id), true)
-            ->color('info');
+            ->color('info')
+            ->disabled(fn () =>
+                !$hasPrApproved ||
+                !in_array($this->record->status, ['Locked', 'Approved', 'Rejected'])
+            )
+            ->tooltip(fn () =>
+                $this->record->status !== 'Locked'
+                    ? 'RFQ must be locked before generating PDF'
+                    : null
+            );
 
         // PR Warning Modal - Show as a mounted action if PR is not approved
         if (!$hasPrApproved) {

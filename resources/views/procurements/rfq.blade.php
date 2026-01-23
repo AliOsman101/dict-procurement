@@ -154,6 +154,8 @@
                     Within {{ $procurement->delivery_value }} calendar days upon receipt of Purchase Order
                 @elseif($procurement->delivery_mode === 'date' && $procurement->delivery_value)
                     {{ \Carbon\Carbon::parse($procurement->delivery_value)->format('F j, Y') }}
+                @elseif($procurement->delivery_mode === 'tbd')
+                    To Be Determined
                 @else
                     Not set
                 @endif
@@ -236,35 +238,42 @@
 
     <!-- BAC Chairperson Line with Signature -->
     @php
-        $rfqApprovals = $procurement->approvals()
-            ->where('module', 'request_for_quotation')
-            ->orderBy('sequence')
-            ->with('employee.certificate')
-            ->get();
-        
-        $bacChairpersonApproval = $rfqApprovals->where('designation', 'BAC Chairperson')
-            ->first();
+
+      $rfqApprover = $rfqApprover ?? null;
+
     @endphp
     <table style="width: 100%; margin-top: 15px; margin-bottom: 10px; border-collapse: collapse;">
         <tr>
             <td style="text-align: left; padding-top: 10px;">
                 <!-- Signature Image - Centered above the name line -->
-                @if($bacChairpersonApproval && $bacChairpersonApproval->signature)
-                    <div class="signature-container" style="margin-left:50px; text-align: center; width: 220px;">
-                        <img src="data:image/png;base64,{{ $bacChairpersonApproval->signature }}" 
-                            class="signature-img"
-                            alt="Signature">
-                    </div>
-                @else
-                    <div style="height:30px; margin-bottom:5px; margin-left:50px;"></div>
-                @endif
-                
-                <!-- Name with underline - keep original positioning -->
-                <div style="font-weight: bold; display: inline-block; width: 310px; text-align: center;">
-                    {{ $bacChairpersonApproval?->employee?->full_name ?? 'Not set' }}
-                </div>
-                <div style="border-top: 1px solid black; width: 220px; margin-left: 50px;"></div>
-                <div style="margin-top: 3px; font-style: italic; margin-left: 115px;">BAC Chairperson</div>
+                <td style="text-align: left; padding-top: 10px;">
+
+    <!-- Signature Image (dynamic) -->
+    @if($rfqApprover && $rfqApprover->employee?->certificate?->signature)
+        <div class="signature-container" style="margin-left:50px; text-align: center; width: 220px;">
+            <img src="data:image/png;base64,{{ $rfqApprover->employee->certificate->signature }}" 
+                class="signature-img"
+                alt="Signature">
+        </div>
+    @else
+        <div style="height:30px; margin-bottom:5px; margin-left:50px;"></div>
+    @endif
+
+    <!-- Name (dynamic) -->
+    <div style="font-weight: bold; display: inline-block; width: 310px; text-align: center;">
+        {{ $rfqApprover?->employee?->full_name ?? 'Not set' }}
+    </div>
+
+    <!-- Underline -->
+    <div style="border-top: 1px solid black; width: 220px; margin-left: 50px;"></div>
+
+    <!-- Designation (dynamic) -->
+    <div style="margin-top: 3px; font-style: italic; margin-left: 115px;">
+        {{ $rfqApprover?->designation ?? 'Designation not set' }}
+    </div>
+
+</td>
+
             </td>
         </tr>
     </table>

@@ -279,12 +279,25 @@ class ViewBac extends ViewRecord
 
         // Always show View PDF action
         $viewPdf = Actions\Action::make('viewPdf')
-            ->label('View PDF')
-            ->icon('heroicon-o-document-text')
-            ->url(fn () => route('procurements.bac.pdf', $this->record), true)
-            ->color('info')
-            ->disabled(fn () => !$hasAoqApproved)
-            ->tooltip(fn () => !$hasAoqApproved ? 'AOQ must be approved first' : null);
+    ->label('View PDF')
+    ->icon('heroicon-o-document-text')
+    ->url(fn () => route('procurements.bac.pdf', $this->record), true)
+    ->color('info')
+    ->disabled(fn () =>
+    !$hasAoqApproved ||
+    !in_array($this->record->status, ['Locked', 'Approved', 'Rejected'])
+)
+
+    ->tooltip(function () use ($hasAoqApproved) {
+        if (!$hasAoqApproved) {
+            return 'AOQ must be approved first';
+        }
+        if ($this->record->status !== 'Locked') {
+            return 'BAC Resolution must be locked before generating PDF';
+        }
+        return null;
+    });
+
 
         // If AOQ is not approved, only show the PDF action (disabled) and the warning modal action
         if (!$hasAoqApproved) {

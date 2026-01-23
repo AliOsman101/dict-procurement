@@ -34,13 +34,13 @@ class RequestForQuotationRevisedAndLockedMail extends Mailable
         $requestedBy = $prChild?->requester?->full_name ?? 'Not set';
 
         return $this->subject('Revised RFQ Ready for Approval - ' . $this->procurement->procurement_id)
-            ->view('emails.rfq_revised_and_locked')
-            ->with([
-                'procurementId' => $this->procurement->procurement_id,
-                'title' => $this->procurement->title,
-                'requestedBy' => $requestedBy,
-                'approvalLink' => $this->approvalLink,
-                'revisor' => auth()->user()->name ?? 'System',
-            ]);
+    ->view('emails.rfq_revised')   // ✅ Correct view name
+    ->with([
+        'procurementId' => $this->procurement->procurement_id,
+        'title' => $this->procurement->title,
+        'requestedBy' => $requestedBy,
+        'approvalLink' => $this->approvalLink,
+        'revisor' => auth()->user()->name ?? 'System',
+    ]);
     }
 }

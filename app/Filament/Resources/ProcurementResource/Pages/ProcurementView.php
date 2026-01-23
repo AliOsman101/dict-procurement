@@ -161,6 +161,34 @@ class ProcurementView extends ViewRecord
                     ])
                     ->columns(3),
 
+                Section::make('Minutes of Opening of Bid Price Quotation')
+                    ->schema([
+                        TextEntry::make('minutes_opening_procurement_id')
+                            ->label('Minutes No.')
+                            ->getStateUsing(fn ($record) => 
+                                $record->children->where('module', 'minutes_of_opening')->first()?->procurement_id ?? 'N/A'),
+
+                        TextEntry::make('minutes_opening_status')
+                            ->label('Status')
+                            ->badge()
+                            ->color(fn ($state) => match ($state) {
+                                'Approved' => 'success',
+                                'Pending'   => 'warning',
+                                'Locked'    => 'danger',
+                                'Rejected'  => 'danger',
+                                default     => 'gray',
+                            })
+                            ->getStateUsing(fn ($record) => 
+                                $this->getModuleStatus($record, 'minutes_of_opening')),
+
+                        TextEntry::make('minutes_opening_document')
+                            ->label('Document')
+                            ->html()
+                            ->getStateUsing(fn ($record) => 
+                                '<a href="' . route('filament.admin.resources.procurements.view-minutes', $record) . '" style="text-decoration: underline;">View</a>'),
+                    ])
+                    ->columns(3),
+
                 Section::make('BAC Resolution Recommending Award')
                     ->schema([
                         TextEntry::make('bac_procurement_id')
@@ -241,6 +269,7 @@ class ProcurementView extends ViewRecord
             'purchase_request',
             'request_for_quotation',
             'abstract_of_quotation',
+            'minutes_of_opening',
             'bac_resolution_recommending_award',
             'purchase_order'
         ];

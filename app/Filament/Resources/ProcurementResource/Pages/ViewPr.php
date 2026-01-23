@@ -15,6 +15,7 @@ use App\Models\ProcurementItem;
 use App\Helpers\ActivityLogger; 
 use Illuminate\Support\Facades\Auth;
 use Carbon\Carbon;
+use App\Mail\PurchaseRequestRequesterSetMail;
 
 class ViewPr extends ViewRecord
 {
@@ -125,7 +126,7 @@ class ViewPr extends ViewRecord
                         TextEntry::make('hdr_approver')->label('')->state('Approver'),
                         TextEntry::make('hdr_sequence')->label('')->state('Sequence'),
                         TextEntry::make('hdr_status')->label('')->state('Status'),
-                        TextEntry::make('hdr_action_date')->label('')->state('Action Date'), // ← changed
+                        TextEntry::make('hdr_action_date')->label('')->state('Action Date'),
                     ])
                     ->extraAttributes(['class' => 'bg-gray-100 dark:bg-gray-800 border-b']),
 
@@ -148,7 +149,7 @@ class ViewPr extends ViewRecord
                                 },
                                 $state
                             )),
-                        TextEntry::make('action_at')  // ← now using action_at
+                        TextEntry::make('action_at')
                             ->label('')
                             ->formatStateUsing(fn ($state) => $state ? Carbon::parse($state)->format('M d, Y') : '—')
                             ->color(fn ($record) => $record->status === 'Rejected' ? 'danger' 
@@ -263,8 +264,15 @@ class ViewPr extends ViewRecord
             ->icon('heroicon-o-document-text')
             ->url(fn () => route('procurements.pr.pdf', $this->record), true)
             ->color('info')
-            ->disabled(fn () => !$hasPpmp)
-            ->tooltip(fn () => !$hasPpmp ? 'You must upload a PPMP first' : null);
+            ->disabled(fn () =>
+                !$hasPpmp ||
+                !in_array($this->record->status, ['Locked', 'Approved', 'Rejected'])
+            )
+            ->tooltip(function () use ($hasPpmp) {
+                if (!$hasPpmp) return 'You must upload a PPMP first';
+                if ($this->record->status !== 'Locked') return 'PR must be locked before generating PDF';
+                return null;
+            });
 
         // MANAGEMENT BUTTONS: Show only when Pending AND not Locked/Approved
         if ($isPending && !$isLockedOrApproved && $hasPpmp) {
@@ -307,20 +315,48 @@ class ViewPr extends ViewRecord
                         ->label(fn ($get) => $get('basis') === 'lot' ? 'Lot Details' : 'Item Details')
                         ->schema([
                             Forms\Components\Grid::make(24)->schema([
+                                Forms\Components\Select::make('common_item_id')
+                                    ->label('Select Pre-saved Item')
+                                    ->options(function () {
+                                        // Detect correct category
+                                        $categoryId = $this->record->category_id 
+                                            ?? ($this->record->parent->category_id ?? null);
+
+                                        if (!$categoryId) {
+                                            return []; // No category, no items
+                                        }
+
+                                        return \App\Models\CommonItem::where('category_id', $categoryId)
+                                            ->pluck('item_description', 'id');
+                                    })
+                                    ->searchable()
+                                    ->reactive()
+                                    ->columnSpan(24)
+                                    ->afterStateUpdated(function ($state, callable $set) {
+                                        if (!$state) return;
+
+                                        $preset = \App\Models\CommonItem::find($state);
+                                        if (!$preset) return;
+
+                                        // Auto-fill fields
+                                        $set('unit', $preset->unit);
+                                        $set('item_description', $preset->item_description);
+                                        $set('unit_cost', $preset->unit_cost);
+                                    }),
                                 Forms\Components\Placeholder::make('item_number_display')
                                     ->label(fn ($get) => $get('../../basis') === 'lot' ? 'Lot No.' : 'Item No.')
                                     ->content(function (Forms\Get $get, Forms\Components\Component $component) {
-                                    // Get the repeater item's key/UUID
+                                        // Get the repeater item's key/UUID
                                         $itemKey = $component->getContainer()->getStatePath();
                                     
-                                    // Get all items from the repeater
+                                        // Get all items from the repeater
                                         $allItems = $get('../../items');
                                         
                                         if (!is_array($allItems)) {
                                             return '1';
                                         }
                                         
-                                    // Find the position of current item by matching the key
+                                        // Find the position of current item by matching the key
                                         $position = 0;
                                         $index = 0;
                                         foreach ($allItems as $key => $item) {
@@ -368,8 +404,7 @@ class ViewPr extends ViewRecord
                                     })
                                     ->columnSpan(2)
                                     ->extraInputAttributes(['class' => 'min-w-0']),
-
-                               Forms\Components\TextInput::make('unit_cost')
+                                Forms\Components\TextInput::make('unit_cost')
                                     ->label('Unit Cost')
                                     ->numeric()
                                     ->prefix('₱')
@@ -380,12 +415,10 @@ class ViewPr extends ViewRecord
                                         $value = is_numeric($state) ? (float) $state : 0;
 
                                         if ($value <= 0) {
-                                        
                                             $key = 'negative_unit_cost_warning_' . md5($component->getStatePath());
-
                                             $livewire = $component->getLivewire();
 
-                                        // Show notification ONLY ONCE per field
+                                            // Show notification ONLY ONCE per field
                                             if (! property_exists($livewire, $key)) {
                                                 \Filament\Notifications\Notification::make()
                                                     ->title('Invalid Unit Cost')
@@ -413,6 +446,7 @@ class ViewPr extends ViewRecord
                             ]),
                         ])
                         ->columns(24)
+                        ->addable(fn ($get) => !($get('basis') === 'lot' && count($get('items') ?? []) >= 1))
                         ->addActionLabel(fn ($get) => $get('basis') === 'lot' ? 'Add Lot' : 'Add Item')
                         ->reorderable()
                         ->reorderableWithDragAndDrop(true)
@@ -435,21 +469,21 @@ class ViewPr extends ViewRecord
                         ->extraAttributes(['class' => 'font-bold text-lg text-right mt-2']),
                 ])
                 ->action(function (array $data) {
-                // Get items and renumber them sequentially
+                    // Get items and renumber them sequentially
                     $items = collect($data['items'] ?? [])
                         ->filter(function ($item) {
-                        // Filter out empty items
+                            // Filter out empty items
                             return !empty($item['item_description']) && 
                                 isset($item['quantity']) && $item['quantity'] > 0 && 
                                 isset($item['unit_cost']) && $item['unit_cost'] > 0;
                         })
-                    ->values() // Reset keys to 0, 1, 2, 3...
+                        ->values() // Reset keys to 0, 1, 2, 3...
                         ->map(function ($item, $index) {
                             $qty = (float) ($item['quantity'] ?? 0);
                             $unitCost = (float) ($item['unit_cost'] ?? 0);
                             
                             return [
-                            'sort' => $index + 1, // Auto-number: 1, 2, 3, 4...
+                                'sort' => $index + 1, // Auto-number: 1, 2, 3, 4...
                                 'unit' => $item['unit'] ?? '',
                                 'item_description' => $item['item_description'] ?? '',
                                 'quantity' => (int) $qty,
@@ -473,6 +507,49 @@ class ViewPr extends ViewRecord
                     
                     if (!empty($items)) {
                         $this->record->items()->createMany($items);
+
+                        // AUTO-SAVE common items for future pre-saved dropdown
+                        $parentCategoryId = $this->record->parent->category_id ?? null;
+
+                        if ($parentCategoryId) {
+                            foreach ($items as $item) {
+                                $description = trim($item['item_description']);
+                                $unit = trim($item['unit']);
+                                $unitCost = $item['unit_cost'];
+                                $categoryId = $this->record->category_id;
+
+                                // Track usage
+                                $tracker = \DB::table('common_item_tracker')
+                                    ->where('item_description', $description)
+                                    ->first();
+
+                                if ($tracker) {
+                                    \DB::table('common_item_tracker')
+                                        ->where('id', $tracker->id)
+                                        ->increment('count');
+                                } else {
+                                    \DB::table('common_item_tracker')->insert([
+                                        'item_description' => $description,
+                                        'unit' => $unit,
+                                        'unit_cost' => $unitCost,
+                                        'count' => 1,
+                                    ]);
+                                }
+
+                                // If count reaches 3 ➜ promote to CommonItem
+                                if ($tracker && $tracker->count + 1 >= 3) {
+                                    \App\Models\CommonItem::updateOrCreate(
+                                        [
+                                            'item_description' => $description,
+                                            'category_id' => $categoryId,
+                                        ],
+                                        [
+                                            'unit' => $unit,
+                                            'unit_cost' => $unitCost,
+                                        ]);
+                                }
+                            }
+                        }
                     }
 
                     $this->record->update([
@@ -492,13 +569,13 @@ class ViewPr extends ViewRecord
                         ->success()
                         ->send();
                 })
-            // Disable submit button if SVP limit is exceeded
+                // Disable submit button if SVP limit is exceeded
                 ->modalSubmitAction(function ($action) {
                     return $action
                         ->label('Save Changes')
                         ->color('primary')
                         ->disabled(function () {
-                        // Access form data from the Livewire component's mounted action data
+                            // Access form data from the Livewire component's mounted action data
                             $data = $this->mountedActionsData[0] ?? [];
                             $items = $data['items'] ?? [];
                             $total = collect($items)->sum(fn ($i) => (float) ($i['total_cost'] ?? 0));
@@ -517,12 +594,46 @@ class ViewPr extends ViewRecord
                     Forms\Components\Select::make('requested_by')
                         ->label('Requested By')
                         ->options(function () {
-                            return \App\Models\Employee::all()->mapWithKeys(function ($employee) {
-                                return [$employee->id => $employee->full_name];
-                            })->toArray();
+                            $involvedEmployeeIds = collect();
+
+                            // Get the parent procurement record
+                            if ($this->record->parent_id) {
+                                $parent = Procurement::find($this->record->parent_id);
+                                
+                                if ($parent) {
+                                    // 1. Get employees assigned to parent procurement (from pivot table)
+                                    $assignedEmployeeIds = $parent->employees()->pluck('employee_id');
+                                    $involvedEmployeeIds = $involvedEmployeeIds->merge($assignedEmployeeIds);
+
+                                    // 2. Get the creator of parent procurement
+                                    if ($parent->created_by) {
+                                        $creatorEmployee = \App\Models\Employee::whereHas('user', function($q) use ($parent) {
+                                            $q->where('id', $parent->created_by);
+                                        })->first();
+                                        
+                                        if ($creatorEmployee) {
+                                            $involvedEmployeeIds->push($creatorEmployee->id);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Remove duplicates and filter out nulls
+                            $involvedEmployeeIds = $involvedEmployeeIds->unique()->filter();
+
+                            // Fetch employee names
+                            return \App\Models\Employee::whereIn('id', $involvedEmployeeIds)
+                                ->orderBy('firstname')
+                                ->orderBy('lastname')
+                                ->get()
+                                ->mapWithKeys(function ($employee) {
+                                    return [$employee->id => $employee->full_name];
+                                })
+                                ->toArray();
                         })
                         ->searchable()
-                        ->required(),
+                        ->required()
+                        ->placeholder('Select employee assigned to this procurement'),
                 ])
                 ->action(function (array $data) {
                     // Check if this is a re-lock after revision
@@ -535,6 +646,22 @@ class ViewPr extends ViewRecord
                         'status' => 'Locked',
                         'requested_by' => $data['requested_by'],
                     ]);
+
+                    // ------------------------------
+                    // EMAIL: Notify Selected Requester
+                    // ------------------------------
+                    $requester = \App\Models\Employee::find($data['requested_by']);
+
+                    if ($requester && $requester->user && !empty($requester->user->email)) {
+                        try {
+                            \Mail::to($requester->user->email)->send(
+                                new \App\Mail\PurchaseRequestRequesterSetMail($this->record)
+                            );
+                        } catch (\Exception $e) {
+                            \Log::error("Failed to send PR requester-set email: {$e->getMessage()}");
+                        }
+                    }
+
                     $this->record->refresh();
 
                     ActivityLogger::log(
@@ -564,7 +691,7 @@ class ViewPr extends ViewRecord
                                     );
                                 }
                             } catch (\Exception $e) {
-                            // Handle silently
+                                // Handle silently
                             }
                         }
                     }

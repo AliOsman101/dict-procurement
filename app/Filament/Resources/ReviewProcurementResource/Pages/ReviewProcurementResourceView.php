@@ -37,6 +37,7 @@ class ReviewProcurementResourceView extends ViewRecord
             'purchase_request' => 'Purchase Request',
             'request_for_quotation' => 'Request for Quotation',
             'abstract_of_quotation' => 'Abstract of Quotation',
+            'minutes_of_opening' => 'Minutes of Opening',
             'bac_resolution_recommending_award' => 'BAC Resolution Recommending Award',
             'purchase_order' => 'Purchase Order',
         ];
@@ -47,6 +48,7 @@ class ReviewProcurementResourceView extends ViewRecord
             'purchase_request' => 'approver-view-pr',
             'request_for_quotation' => 'approver-view-rfq',
             'abstract_of_quotation' => 'approver-view-aoq',
+            'minutes_of_opening' => 'approver-view-mo',
             'bac_resolution_recommending_award' => 'approver-view-bac',
             'purchase_order' => 'approver-view-po',
         ];

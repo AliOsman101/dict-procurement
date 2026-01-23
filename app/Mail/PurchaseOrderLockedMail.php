@@ -13,20 +13,14 @@ class PurchaseOrderLockedMail extends Mailable
 
     public $procurement;
 
-    /**
-     * Create a new message instance.
-     */
     public function __construct(Procurement $procurement)
     {
         $this->procurement = $procurement;
     }
 
-    /**
-     * Build the message.
-     */
     public function build()
     {
         return $this->subject('Purchase Order Locked: ' . $this->procurement->procurement_id)
-                    ->markdown('emails.purchase_order_locked');
+                    ->view('emails.purchase-order-locked'); // FIXED
     }
 }

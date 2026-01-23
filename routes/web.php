@@ -3,6 +3,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\GoogleController;
 use App\Http\Controllers\ProcurementPdfController;
+use App\Http\Controllers\RfqReceiveController;
 
 Route::get('/', function () {
     if (Auth::check()) {
@@ -23,10 +24,14 @@ Route::middleware(['auth'])->group(function () {
         ->name('procurements.rfq.pdf');
     Route::get('/procurements/{procurement}/aoq-pdf', [ProcurementPdfController::class, 'generateAoqPdf'])
         ->name('procurements.aoq.pdf');
+    Route::get('/procurements/{procurement}/mo-pdf', [ProcurementPdfController::class, 'generateMoPdf'])
+        ->name('procurements.mo.pdf');
     Route::get('/procurements/{procurement}/bac-pdf', [ProcurementPdfController::class, 'generateBacPdf'])
         ->name('procurements.bac.pdf');
     Route::get('/procurements/{procurement}/po-pdf', [ProcurementPdfController::class, 'generatePoPdf'])
         ->name('procurements.po.pdf');
     Route::get('/procurements/rfq-response/{rfqResponseId}/pdf', [App\Http\Controllers\ProcurementPdfController::class, 'generateRfqResponsePdf'])
         ->name('procurements.rfq-response.pdf');
+        Route::get('/rfq/receive/{id}', [RfqReceiveController::class, 'receive'])
+    ->name('rfq.receive');
 });

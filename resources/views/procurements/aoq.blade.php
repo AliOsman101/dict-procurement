@@ -95,14 +95,50 @@
 
         return $eval ? ['status'=>$eval->status,'remarks'=>$eval->remarks??''] : ['status'=>'pending','remarks'=>''];
     }
+    
     function supplierPassed($rfqResponse, $aoqId) {
         return !\App\Models\AoqEvaluation::where('procurement_id',$aoqId)
             ->where('rfq_response_id',$rfqResponse->id)
             ->where('requirement','not like','quote_%')
             ->where('status','fail')->exists();
     }
+    
     function isAboveABC($quote, $item) {
         return $quote && $item && $quote->total_value > $item->total_cost;
+    }
+
+    // NEW: Get winning bid evaluation for an item from AoqEvaluation table
+    function getWinningBidForItem($itemId, $aoqId, $allRfqResponses) {
+        $winningEval = \App\Models\AoqEvaluation::where('procurement_id', $aoqId)
+            ->where('requirement', 'quote_' . $itemId)
+            ->where('lowest_bid', true)
+            ->first();
+        
+        if (!$winningEval) {
+            return null;
+        }
+
+        // Find the RFQ response and its quote
+        $winningResponse = $allRfqResponses->firstWhere('id', $winningEval->rfq_response_id);
+        if (!$winningResponse) {
+            return null;
+        }
+
+        $winningQuote = $winningResponse->quotes->firstWhere('procurement_item_id', $itemId);
+        
+        return $winningQuote ? [
+            'quote' => $winningQuote,
+            'response' => $winningResponse
+        ] : null;
+    }
+
+    // NEW: Check if a specific quote is marked as winning bid in evaluations
+    function isWinningBid($itemId, $rfqResponseId, $aoqId) {
+        return \App\Models\AoqEvaluation::where('procurement_id', $aoqId)
+            ->where('rfq_response_id', $rfqResponseId)
+            ->where('requirement', 'quote_' . $itemId)
+            ->where('lowest_bid', true)
+            ->exists();
     }
 @endphp
 
@@ -266,20 +302,14 @@
     <!-- Item Rows -->
     @foreach($items as $index => $item)
         @php
+            // Get quotes from the 3 displayed suppliers for this item
             $itemQuotes = [];
-            foreach($suppliers as $s) $itemQuotes[] = $s->quotes->firstWhere('procurement_item_id',$item->id);
-            $lowestQuote = null; $lowestValue = PHP_FLOAT_MAX;
-            foreach($itemQuotes as $idx=>$quote){
-                if($quote && $quote->total_value>0){
-                    $supplier = $suppliers[$idx];
-                    $passed = supplierPassed($supplier,$aoq->id);
-                    $aboveABC = isAboveABC($quote,$item);
-                    if($passed && !$aboveABC && $quote->total_value < $lowestValue){
-                        $lowestValue = $quote->total_value;
-                        $lowestQuote = ['index'=>$idx,'quote'=>$quote];
-                    }
-                }
+            foreach($suppliers as $s) {
+                $itemQuotes[] = $s->quotes->firstWhere('procurement_item_id', $item->id);
             }
+
+            // Get the actual winning bid from AoqEvaluation table (could be from any supplier, not just top 3)
+            $winningBidData = getWinningBidForItem($item->id, $aoq->id, $rfqResponses);
         @endphp
         <tr>
             <td style="border:1px solid black; text-align:center;">{{ $item->sort }}</td>
@@ -287,32 +317,45 @@
             <td style="border:1px solid black; text-align:center;">{{ $item->quantity }}</td>
             <td style="border:1px solid black; text-align:center;">{{ $item->unit }}</td>
             <td style="border:1px solid black; text-align:right;">{{ number_format($item->unit_cost,2) }}</td>
+            
             @for($i=0;$i<3;$i++)
                 @php
                     $quote = $itemQuotes[$i] ?? null;
-                    $supplier = $i<$supplierCount?$suppliers[$i]:null;
-                    $isLowest = $lowestQuote && $lowestQuote['index']===$i;
-                    $bg = $isLowest?'background-color:#ffff99;':'';
-                    $txt = '';
-                    if($quote && $supplier){
-                        $failed = !supplierPassed($supplier,$aoq->id);
-                        $above = isAboveABC($quote,$item);
-                        if($failed||$above) $txt='color:red;';
+                    $supplier = $i < $supplierCount ? $suppliers[$i] : null;
+                    
+                    // Check if THIS specific quote is the winning bid
+                    $isWinner = false;
+                    if ($quote && $supplier) {
+                        $isWinner = isWinningBid($item->id, $supplier->id, $aoq->id);
                     }
-                    $cellStyle = $bg.$txt;
+                    
+                    $bg = $isWinner ? 'background-color:#ffff99;' : '';
+                    $txt = '';
+                    
+                    if ($quote && $supplier) {
+                        $failed = !supplierPassed($supplier, $aoq->id);
+                        $above = isAboveABC($quote, $item);
+                        if ($failed || $above) {
+                            $txt = 'color:red;';
+                        }
+                    }
+                    
+                    $cellStyle = $bg . $txt;
                 @endphp
                 <td style="border-top:1px solid black; border-bottom:1px solid black; border-left:2px solid black; border-right:1px solid black; text-align:right; {{ $cellStyle }}">
-                    {{ $quote?number_format($quote->unit_value,2):'0.00' }}
+                    {{ $quote ? number_format($quote->unit_value, 2) : '0.00' }}
                 </td>
                 <td style="border-top:1px solid black; border-bottom:1px solid black; border-left:1px solid black; border-right:2px solid black; text-align:right; {{ $cellStyle }}">
-                    {{ $quote?number_format($quote->total_value,2):'0.00' }}
+                    {{ $quote ? number_format($quote->total_value, 2) : '0.00' }}
                 </td>
             @endfor
+            
+            {{-- LOWEST BID column - shows the actual winner from evaluations --}}
             <td style="border:1px solid black; text-align:right; background-color:#ffffc8;">
-                {{ $lowestQuote?number_format($lowestQuote['quote']->unit_value,2):'0.00' }}
+                {{ $winningBidData ? number_format($winningBidData['quote']->unit_value, 2) : '0.00' }}
             </td>
             <td style="border:1px solid black; text-align:right; background-color:#ffffc8;">
-                {{ $lowestQuote?number_format($lowestQuote['quote']->total_value,2):'0.00' }}
+                {{ $winningBidData ? number_format($winningBidData['quote']->total_value, 2) : '0.00' }}
             </td>
         </tr>
     @endforeach
@@ -336,28 +379,43 @@
         <td colspan="5" style="border-left:1px solid black; border-right:1px solid black; border-bottom:1px solid black;"></td>
         @for($i=0;$i<3;$i++)
             @php
-                $supplier = $i<$supplierCount?$suppliers[$i]:null;
-                $total = $supplier?$supplier->quotes->sum('total_value'):0;
-                $failed = $supplier?!supplierPassed($supplier,$aoq->id):false;
-                $txt = $failed?'color:red;':'';
+                $supplier = $i < $supplierCount ? $suppliers[$i] : null;
+                $total = $supplier ? $supplier->quotes->sum('total_value') : 0;
+                $failed = $supplier ? !supplierPassed($supplier, $aoq->id) : false;
+                $txt = $failed ? 'color:red;' : '';
             @endphp
             <td style="border-left:2px solid black; border-right:1px solid black; border-bottom:2px solid black;"></td>
             <td style="border-left:1px solid black; border-right:2px solid black; border-bottom:2px solid black; text-align:right; {{ $txt }}">
-                P {{ number_format($total,2) }}
+                P {{ number_format($total, 2) }}
             </td>
         @endfor
         @php
-            $lowestTotal = PHP_FLOAT_MAX;
-            foreach($suppliers as $s){
-                if(supplierPassed($s,$aoq->id)){
-                    $st = $s->quotes->sum('total_value');
-                    if($st>0 && $st<$lowestTotal) $lowestTotal=$st;
+            // For per-item: sum all winning bids
+            // For per-lot: use the lowest qualified total
+            if ($isLot) {
+                $lowestTotal = PHP_FLOAT_MAX;
+                foreach($suppliers as $s) {
+                    if(supplierPassed($s, $aoq->id)) {
+                        $st = $s->quotes->sum('total_value');
+                        if($st > 0 && $st < $lowestTotal) {
+                            $lowestTotal = $st;
+                        }
+                    }
+                }
+                if($lowestTotal === PHP_FLOAT_MAX) $lowestTotal = 0;
+            } else {
+                // Per-item: sum all winning quotes
+                $lowestTotal = 0;
+                foreach($items as $item) {
+                    $winningBidData = getWinningBidForItem($item->id, $aoq->id, $rfqResponses);
+                    if ($winningBidData) {
+                        $lowestTotal += $winningBidData['quote']->total_value;
+                    }
                 }
             }
-            if($lowestTotal===PHP_FLOAT_MAX) $lowestTotal=0;
         @endphp
         <td colspan="2" style="border:1px solid black; text-align:right; background-color:#ffffc8;">
-            P {{ number_format($lowestTotal,2) }}
+            P {{ number_format($lowestTotal, 2) }}
         </td>
     </tr>
 </table>
@@ -368,6 +426,19 @@
         ->orderBy('sequence')
         ->with('employee.certificate')
         ->get();
+
+    // Count who actually APPROVED (status = Approved + has signature)
+    $approved = $aoqApprovals->where('status', 'Approved')->whereNotNull('signature');
+
+    $chairperson = $approved->where('sequence', 5)->first();  // BAC Chairperson
+    $viceChair   = $approved->where('sequence', 4)->first();   // Vice-Chair
+    $members     = $approved->whereIn('sequence', [1,2,3]);   // BAC Members + Provisional
+
+    $hasChairOrVice = $chairperson || $viceChair;
+    $hasTwoMembers  = $members->count() >= 2;
+
+    // This is the magic boolean
+    $isFullyApproved = $approved->count() >= 3 && $hasChairOrVice && $hasTwoMembers;
 @endphp
 
 <!-- Prepared / Legend -->
@@ -419,48 +490,107 @@
 
 <br><br>
 
-<!-- Reviewed by (BAC Members) -->
-<table class="no-border" style="width:100%; text-align:center;">
+<!-- Reviewed by-->
+@php
+use App\Models\DefaultApprover;
+use Illuminate\Support\Facades\Crypt;
+
+/*
+ |-------------------------------------------------------
+ | Fetch approver from DefaultApprover by sequence
+ |-------------------------------------------------------
+*/
+function getAoqDefault($seq) {
+    return DefaultApprover::where('module', 'abstract_of_quotation')
+        ->where('sequence', $seq)
+        ->with(['employee.certificate'])
+        ->first();
+}
+
+$member1 = getAoqDefault(1);
+$member2 = getAoqDefault(2);
+$member3 = getAoqDefault(3);
+$vice    = getAoqDefault(4);
+$chair   = getAoqDefault(5);
+
+/*
+ |-------------------------------------------------------
+ | Build signatory block (signature + name + designation)
+ |-------------------------------------------------------
+*/
+function aoq_signatory_block($defaultApprover, $fallbackLabel) {
+
+    if (!$defaultApprover) {
+        return '
+            <div style="height:25px;"></div>
+            <span class="underline">__________________</span><br>
+            <i>'.$fallbackLabel.'</i>
+        ';
+    }
+
+    $employee = $defaultApprover->employee;
+    $name = strtoupper($employee->full_name ?? 'NOT SET');
+    $designation = $defaultApprover->designation ?? $fallbackLabel;
+
+    // Handle signature decryption if available
+    $signature = null;
+    if ($employee?->certificate?->signature_image_path) {
+        try {
+            $signature = Crypt::decryptString($employee->certificate->signature_image_path);
+        } catch (\Exception $e) {
+            $signature = null;
+        }
+    }
+
+    return '
+        '.($signature ?
+            '<div class="signature-container">
+                <img class="signature-img" src="data:image/png;base64,'.$signature.'">
+            </div>'
+            :
+            '<div style="height:25px;"></div>'
+        ).'
+        <span class="underline">'.$name.'</span><br>
+        <i>'.$designation.'</i>
+    ';
+}
+@endphp
+
+<table class="no-border" style="width:100%; margin-top:30px; text-align:center;">
     <tr>
         <td colspan="6" style="text-align:left; border:none; padding:5px;">
             <b>Reviewed by:</b>
         </td>
     </tr>
+
+    <!-- Row 1: BAC Members -->
     <tr>
-        @php $bacMembers = $aoqApprovals->whereIn('sequence',[1,2,3])->sortBy('sequence'); @endphp
-        @foreach($bacMembers as $approval)
-            <td colspan="2" style="width:33.33%; text-align:center; border:none; padding:5px;">
-                @if($approval->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $approval->signature }}" class="signature-img" alt="Signature">
-                    </div>
-                @else
-                    <div style="height:25px;"></div>
-                @endif
-                <span class="underline">{{ strtoupper($approval->employee->full_name ?? 'N/A') }}</span><br>
-                <i>{{ $approval->sequence == 3 ? 'Provisional Member' : 'BAC Member' }}</i>
-            </td>
-        @endforeach
-        <td style="width:16.67%; border:none;"></td>
+        <td colspan="2" style="border:none;">
+            {!! aoq_signatory_block($member1, 'BAC Member') !!}
+        </td>
+
+        <td colspan="2" style="border:none;">
+            {!! aoq_signatory_block($member2, 'BAC Member') !!}
+        </td>
+
+        <td colspan="2" style="border:none;">
+            {!! aoq_signatory_block($member3, 'Provisional Member') !!}
+        </td>
     </tr>
 
-    <!-- Chairpersons -->
+    <!-- Row 2: Vice-Chairperson and Chairperson -->
     <tr>
-        @php $chairpersons = $aoqApprovals->whereIn('sequence',[4,5])->sortBy('sequence'); @endphp
-        <td style="width:16.67%; border:none;"></td>
-        @foreach($chairpersons as $approval)
-            <td colspan="2" style="width:33.33%; text-align:center; border:none; padding:5px;">
-                @if($approval->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $approval->signature }}" class="signature-img" alt="Signature">
-                    </div>
-                @else
-                    <div style="height:25px;"></div>
-                @endif
-                <span class="underline">{{ strtoupper($approval->employee->full_name ?? 'N/A') }}</span><br>
-                <i>{{ $approval->sequence == 4 ? 'BAC Vice - Chairperson' : 'BAC Chairperson' }}</i>
-            </td>
-        @endforeach
+        <td style="border:none;"></td>
+
+        <td colspan="2" style="border:none;">
+            {!! aoq_signatory_block($vice, 'BAC Vice-Chairperson') !!}
+        </td>
+
+        <td colspan="2" style="border:none;">
+            {!! aoq_signatory_block($chair, 'BAC Chairperson') !!}
+        </td>
+
+        <td style="border:none;"></td>
     </tr>
 </table>
 

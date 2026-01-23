@@ -15,6 +15,11 @@ use App\Models\Procurement;
 use App\Helpers\ActivityLogger;
 use Illuminate\Support\Facades\Auth;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Mail;
+use App\Mail\PurchaseOrderSupplierMail;
+use App\Models\AoqEvaluation;
+
+
 
 class ViewPo extends ViewRecord
 {
@@ -376,12 +381,25 @@ class ViewPo extends ViewRecord
 
         // View PDF action (visible to everyone, but disabled if no BAC approved)
         $viewPdf = Actions\Action::make('viewPdf')
-            ->label('View PDF')
-            ->icon('heroicon-o-document-text')
-            ->url(fn () => route('procurements.po.pdf', $this->record->id), true)
-            ->color('info')
-            ->disabled(fn () => !$hasBacApproved)
-            ->tooltip(fn () => !$hasBacApproved ? 'BAC Resolution must be approved first' : null);
+    ->label('View PDF')
+    ->icon('heroicon-o-document-text')
+    ->url(fn () => route('procurements.po.pdf', $this->record->id), true)
+    ->color('info')
+    ->disabled(fn () =>
+    !$hasBacApproved ||
+    !in_array($this->record->status, ['Locked', 'Approved', 'Rejected'])
+)
+
+    ->tooltip(function () use ($hasBacApproved) {
+        if (!$hasBacApproved) {
+            return 'BAC Resolution must be approved first';
+        }
+        if ($this->record->status !== 'Locked') {
+            return 'Purchase Order must be locked before generating PDF';
+        }
+        return null;
+    });
+
 
         // BAC Warning Modal - Show as a mounted action if no BAC approved
         if (!$hasBacApproved) {
@@ -482,6 +500,7 @@ class ViewPo extends ViewRecord
             ->modalDescription('Once locked, this PO cannot be edited anymore.')
             ->modalSubmitActionLabel('Yes, Lock PO')
             ->action(function () {
+                \Log::info('PO LOCK REACHED');
                 $this->record->update(['status' => 'Locked']);
                 $this->record->refresh();
 
@@ -492,25 +511,22 @@ class ViewPo extends ViewRecord
                 );
 
         // Send Gmail notifications to all PO approvers + requester
-        $approvers = $this->record->approvals()
-            ->where('module', 'purchase_order')
-            ->with('employee.user')
-            ->get();
+        // Send Gmail notifications to all PO approvers
+$approvers = $this->record->approvals()
+    ->where('module', 'purchase_order')
+    ->with('employee.user')
+    ->get();
 
-        foreach ($approvers as $approval) {
+foreach ($approvers as $approval) {
     $user = $approval->employee->user ?? null;
 
-    // Only send if email exists and is not empty
     if ($user && !empty(trim($user->email))) {
-        try {
-            \Mail::to($user->email)->send(
-                new \App\Mail\PurchaseOrderLockedMail($this->record)
-            );
-        } catch (\Exception $e) {
-            // Fail silently
-        }
+        Mail::to($user->email)->send(
+            new \App\Mail\PurchaseOrderLockedMail($this->record)
+        );
     }
 }
+
 
 $creator = $this->record->parent?->requester?->user ?? null;
 
@@ -520,9 +536,140 @@ if ($creator && !empty(trim($creator->email))) {
         \Mail::to($creator->email)->send(
             new \App\Mail\PurchaseOrderLockedMail($this->record)
         );
-    } catch (\Exception $e) {}
+    } catch (\Exception $e) {
+    }
 }
 
+
+try {
+    $parent = $this->record->parent;
+
+    if ($parent) {
+        $aoq = $parent->children()
+            ->where('module', 'abstract_of_quotation')
+            ->first();
+
+        if ($aoq) {
+
+           // 🔥 GET AOQ WINNERS ONLY (SOURCE OF TRUTH)
+$aoqWinners = AoqEvaluation::where('procurement_id', $aoq->id)
+    ->where('lowest_bid', true)
+    ->with('rfqResponse.supplier', 'rfqResponse.quotes.procurementItem')
+    ->get();
+
+// GET PR + BASIS
+$pr = $this->record->parent
+    ?->children()
+    ->where('module', 'purchase_request')
+    ->first();
+
+$basis = $pr?->basis ?? 'item';
+
+// =======================================
+// 🔥 LOT BASIS (ONE SUPPLIER, ALL ITEMS)
+// =======================================
+if ($basis === 'lot') {
+
+    $winnerEval = $aoqWinners->first();
+
+    if (! $winnerEval) {
+        \Log::warning('LOT BASIS: No AOQ winner found');
+    } else {
+
+        $supplier = $winnerEval->rfqResponse->supplier;
+
+        $items = $aoqWinners
+            ->unique('requirement')
+            ->map(function ($eval) {
+                $quote = $eval->winningQuote();
+                if (! $quote) return null;
+
+                $item = $quote->procurementItem;
+                $item->unit_cost  = $quote->unit_value;
+                $item->total_cost = $quote->total_value;
+                return $item;
+            })
+            ->filter()
+            ->values();
+
+        \Log::info('PO SUPPLIER MAIL CHECK', [
+            'basis'       => 'lot',
+            'supplier'    => $supplier->business_name,
+            'email'       => $supplier->email_address,
+            'items_count' => $items->count(),
+        ]);
+
+        if ($supplier->email_address && $items->isNotEmpty()) {
+            Mail::to($supplier->email_address)->send(
+                new PurchaseOrderSupplierMail(
+                    $this->record,
+                    $supplier,
+                    $items
+                )
+            );
+        }
+    }
+}
+
+
+// =======================================
+// 🔹 ITEM BASIS (MULTIPLE SUPPLIERS)
+// =======================================
+else {
+
+   $groupedBySupplier = $aoqWinners
+    ->groupBy(fn ($e) => $e->winningQuote()?->rfqResponse?->supplier_id)
+    ->filter(fn ($group) => $group->isNotEmpty());
+
+foreach ($groupedBySupplier as $supplierId => $supplierEvaluations) {
+
+    $supplier = $supplierEvaluations
+        ->first()
+        ->winningQuote()
+        ->rfqResponse
+        ->supplier;
+
+    $items = $supplierEvaluations
+        ->map(function ($eval) {
+            $quote = $eval->winningQuote();
+            if (! $quote) return null;
+
+            $item = clone $quote->procurementItem;
+            $item->unit_cost  = $quote->unit_value;
+            $item->total_cost = $quote->total_value;
+
+            return $item;
+        })
+        ->filter()
+        ->values();
+
+    \Log::info('PO SUPPLIER MAIL CHECK', [
+        'basis'       => 'item',
+        'supplier'    => $supplier->business_name,
+        'items'       => $items->pluck('item_description'),
+    ]);
+
+    if ($supplier->email_address && $items->isNotEmpty()) {
+        Mail::to($supplier->email_address)->send(
+            new PurchaseOrderSupplierMail(
+                $this->record,
+                $supplier,
+                $items
+            )
+        );
+    }
+}
+}
+
+
+
+        }
+    }
+} catch (\Exception $e) {
+    \Log::error('PO Supplier Mail Failed', [
+        'error' => $e->getMessage(),
+    ]);
+}
 
         Notification::make()
             ->title('PO locked and approvers notified.')

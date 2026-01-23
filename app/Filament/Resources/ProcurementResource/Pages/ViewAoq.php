@@ -234,172 +234,223 @@ class ViewAoq extends ViewRecord
             ->exists();
     }
 
-    // Detect lowest bids and mark evaluations
     private function detectLowestBids($record)
     {
-        $procurementItems = $record->procurementItems;
-        $rfqResponses = $record->rfqResponses;
-        
-        if ($procurementItems->isEmpty() || $rfqResponses->isEmpty()) {
+        $pr = Procurement::where('parent_id', $record->parent_id)
+            ->where('module', 'purchase_request')
+            ->first();
+
+        $basis = $pr?->basis ?? 'item'; // default to item
+        $items = $record->procurementItems;
+        $responses = $record->rfqResponses;
+
+        if ($items->isEmpty() || $responses->isEmpty()) {
             return;
         }
-        
-        // Check for existing tie-breaking record
-        $hasTieBreakingRecord = \DB::table('aoq_tie_breaking_records')
-            ->where('procurement_id', $record->id)
-            ->exists();
-        
-        $supplierTotals = [];
-        foreach ($rfqResponses as $rfqResponse) {
-            $failedDocs = AoqEvaluation::where('procurement_id', $record->id)
-                ->where('rfq_response_id', $rfqResponse->id)
-                ->where('requirement', 'not like', 'quote_%')
-                ->where('status', 'fail')
-                ->exists();
-            
-            $totalQuoted = $rfqResponse->quotes->sum('total_value');
-            
-            $supplierTotals[] = [
-                'rfq_response_id' => $rfqResponse->id,
-                'total_quoted' => $totalQuoted,
-                'disqualified' => $failedDocs,
-            ];
-        }
-        
-        usort($supplierTotals, function($a, $b) {
-            return $a['total_quoted'] <=> $b['total_quoted'];
-        });
-        
-        // Determine winning supplier
-        $winningSupplier = null;
-        
-        if ($hasTieBreakingRecord) {
-            $tieRecord = \DB::table('aoq_tie_breaking_records')
-                ->where('procurement_id', $record->id)
-                ->first();
-            
-            if ($tieRecord) {
-                $winningSupplier = $tieRecord->winner_rfq_response_id;
-            }
+
+        // Clear previous quote evaluations
+        AoqEvaluation::where('procurement_id', $record->id)
+            ->where('requirement', 'like', 'quote_%')
+            ->delete();
+
+        if ($basis === 'lot') {
+            // Grand total winner
+            $this->detectLowestBidsByGrandTotal($record);
         } else {
-            // Check for tied suppliers
-            $tieInfo = $this->detectTiedSuppliers($record);
-            
-            if ($tieInfo) {
-                // Mark evaluations for tied suppliers
-                foreach ($procurementItems as $item) {
-                    $quotesForItem = $rfqResponses
-                        ->flatMap->quotes
-                        ->where('procurement_item_id', $item->id)
-                        ->filter(fn($quote) => $quote->unit_value > 0);
-                    
-                    if ($quotesForItem->isEmpty()) continue;
-                    
-                    foreach ($quotesForItem as $quote) {
-                        $thisSupplierDisqualified = collect($supplierTotals)
-                            ->firstWhere('rfq_response_id', $quote->rfq_response_id)['disqualified'] ?? false;
-                        
-                        AoqEvaluation::updateOrCreate(
-                            [
-                                'rfq_response_id' => $quote->rfq_response_id,
-                                'procurement_id' => $record->id,
-                                'requirement' => 'quote_' . $item->id,
-                            ],
-                            [
-                                'status' => $thisSupplierDisqualified ? 'fail' : 'pass',
-                                'lowest_bid' => false,
-                                'remarks' => $thisSupplierDisqualified 
-                                    ? 'Disqualified due to failed document evaluation' 
-                                    : 'Awaiting tie-breaking resolution',
-                            ]
-                        );
-                    }
-                }
-                return;
-            } else {
-                // Select winner if no tie
-                foreach ($supplierTotals as $supplier) {
-                    if (!$supplier['disqualified']) {
-                        $winningSupplier = $supplier['rfq_response_id'];
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // Update evaluations with winner
-        if ($winningSupplier) {
-            foreach ($procurementItems as $item) {
-                $quotesForItem = $rfqResponses
-                    ->flatMap->quotes
-                    ->where('procurement_item_id', $item->id)
-                    ->filter(fn($quote) => $quote->unit_value > 0);
-                
-                if ($quotesForItem->isEmpty()) continue;
-                
-                foreach ($quotesForItem as $quote) {
-                    $thisSupplierDisqualified = collect($supplierTotals)
-                        ->firstWhere('rfq_response_id', $quote->rfq_response_id)['disqualified'] ?? false;
-                    
-                    $isWinner = $quote->rfq_response_id === $winningSupplier;
-                    
-                    $remarks = null;
-                    if ($thisSupplierDisqualified) {
-                        $remarks = 'Disqualified due to failed document evaluation';
-                    } elseif ($isWinner) {
-                        if ($hasTieBreakingRecord) {
-                            $tieRecord = \DB::table('aoq_tie_breaking_records')
-                                ->where('procurement_id', $record->id)
-                                ->first();
-                            $remarks = sprintf(
-                                'Winning bid - determined by %s (tied at ₱%s with %d other supplier(s))',
-                                $tieRecord->method === 'coin_toss' ? 'coin toss' : 'random draw',
-                                number_format($tieRecord->tied_amount, 2),
-                                $tieRecord->tied_suppliers_count - 1
-                            );
-                        } else {
-                            $remarks = 'Winning bid - lowest total quoted amount';
-                        }
-                    }
-                    
-                    AoqEvaluation::updateOrCreate(
-                        [
-                            'rfq_response_id' => $quote->rfq_response_id,
-                            'procurement_id' => $record->id,
-                            'requirement' => 'quote_' . $item->id,
-                        ],
-                        [
-                            'status' => $thisSupplierDisqualified ? 'fail' : 'pass',
-                            'lowest_bid' => $isWinner,
-                            'remarks' => $remarks,
-                        ]
-                    );
-                }
+            // Per-item winner
+            foreach ($items as $item) {
+                $this->detectLowestBidForItem($record, $item);
             }
         }
     }
 
-    // Store tie-breaking record for audit trail
-    private function storeTieBreakingRecord($record, $tieInfo, $winner)
+    private function detectLowestBidsByGrandTotal($record)
+    {
+        $responses = $record->rfqResponses;
+        $supplierTotals = [];
+
+        foreach ($responses as $response) {
+            $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                ->where('rfq_response_id', $response->id)
+                ->where('requirement', 'not like', 'quote_%')
+                ->where('status', 'fail')
+                ->exists();
+
+            $total = $response->quotes->sum('total_value');
+
+            $supplierTotals[] = [
+                'rfq_response_id' => $response->id,
+                'supplier_name'   => $response->supplier?->business_name ?? 'Unknown',
+                'total_quoted'    => $total,
+                'disqualified'    => $disqualified,
+            ];
+        }
+
+        $qualified = collect($supplierTotals)->where('disqualified', false);
+        if ($qualified->isEmpty()) return;
+
+        $lowest = $qualified->min('total_quoted');
+        $tied = $qualified->where('total_quoted', $lowest);
+
+        $winnerId = null;
+
+        if ($tied->count() > 1) {
+            $existing = \DB::table('aoq_tie_breaking_records')
+                ->where('procurement_id', $record->id)
+                ->whereNull('procurement_item_id')
+                ->first();
+
+            if ($existing) {
+                $winnerId = $existing->winner_rfq_response_id;
+            } else {
+                return; // Wait for tie-breaking
+            }
+        } else {
+            $winnerId = $tied->first()['rfq_response_id'];
+        }
+
+        foreach ($record->procurementItems as $item) {
+            $quotes = $responses->flatMap->quotes->where('procurement_item_id', $item->id);
+            foreach ($quotes as $quote) {
+                $isWinner = $quote->rfq_response_id == $winnerId;
+                $disqualified = collect($supplierTotals)->firstWhere('rfq_response_id', $quote->rfq_response_id)['disqualified'] ?? true;
+
+                AoqEvaluation::updateOrCreate(
+                    [
+                        'procurement_id'   => $record->id,
+                        'rfq_response_id'  => $quote->rfq_response_id,
+                        'requirement'      => 'quote_' . $item->id,
+                    ],
+                    [
+                        'status'     => $disqualified ? 'fail' : 'pass',
+                        'lowest_bid' => !$disqualified && $isWinner,
+                        'remarks'    => $disqualified ? 'Disqualified due to failed documents' : ($isWinner ? 'Winning bid (lowest total)' : null),
+                    ]
+                );
+            }
+        }
+    }
+
+    private function detectLowestBidForItem($record, $item)
+    {
+        $responses = $record->rfqResponses;
+        $quotes = $responses->flatMap->quotes
+            ->where('procurement_item_id', $item->id)
+            ->where('unit_value', '>', 0);
+
+        if ($quotes->isEmpty()) return;
+
+        $quoteData = [];
+        foreach ($quotes as $quote) {
+            $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                ->where('rfq_response_id', $quote->rfq_response_id)
+                ->where('requirement', 'not like', 'quote_%')
+                ->where('status', 'fail')
+                ->exists();
+
+            $quoteData[] = [
+                'quote'           => $quote,
+                'unit_value'      => $quote->unit_value,
+                'disqualified'    => $disqualified,
+                'supplier_name'   => $quote->rfqResponse->supplier?->business_name ?? 'Unknown',
+                'rfq_response_id' => $quote->rfq_response_id,
+            ];
+        }
+
+        $qualified = collect($quoteData)->where('disqualified', false);
+        if ($qualified->isEmpty()) {
+            // All disqualified → mark all as fail
+            foreach ($quoteData as $qd) {
+                AoqEvaluation::updateOrCreate([
+                    'procurement_id'  => $record->id,
+                    'rfq_response_id' => $qd['rfq_response_id'],
+                    'requirement'     => 'quote_' . $item->id,
+                ], [
+                    'status' => 'fail',
+                    'lowest_bid' => false,
+                    'remarks' => 'Disqualified due to failed document evaluation',
+                ]);
+            }
+            return;
+        }
+
+        $lowestPrice = $qualified->min('unit_value');
+        $tiedQuotes = $qualified->where('unit_value', $lowestPrice);
+
+        $winnerResponseId = null;
+
+        if ($tiedQuotes->count() > 1) {
+            // Check if tie already resolved
+            $existing = \DB::table('aoq_tie_breaking_records')
+                ->where('procurement_id', $record->id)
+                ->where('procurement_item_id', $item->id)
+                ->first();
+
+            if ($existing) {
+                $winnerResponseId = $existing->winner_rfq_response_id;
+            } else {
+                // Tie exists and not yet resolved → mark all as pending
+                foreach ($quoteData as $qd) {
+                    AoqEvaluation::updateOrCreate([
+                        'procurement_id'  => $record->id,
+                        'rfq_response_id' => $qd['rfq_response_id'],
+                        'requirement'     => 'quote_' . $item->id,
+                    ], [
+                        'status' => $qd['disqualified'] ? 'fail' : 'pass',
+                        'lowest_bid' => false,
+                        'remarks' => $qd['disqualified']
+                            ? 'Disqualified due to failed documents'
+                            : 'Tied lowest bid – awaiting tie-breaking',
+                    ]);
+                }
+                return; // Wait for user to resolve tie
+            }
+        } else {
+            $winnerResponseId = $tiedQuotes->first()['rfq_response_id'];
+        }
+
+        // Mark winner and others
+        foreach ($quoteData as $qd) {
+            $isWinner = $qd['rfq_response_id'] == $winnerResponseId;
+
+            AoqEvaluation::updateOrCreate([
+                'procurement_id'  => $record->id,
+                'rfq_response_id' => $qd['rfq_response_id'],
+                'requirement'     => 'quote_' . $item->id,
+            ], [
+                'status'     => $qd['disqualified'] ? 'fail' : 'pass',
+                'lowest_bid' => !$qd['disqualified'] && $isWinner,
+                'remarks'    => $qd['disqualified']
+                    ? 'Disqualified due to failed documents'
+                    : ($isWinner ? 'Winning bid for this item' : null),
+            ]);
+        }
+    }
+
+    /**
+     * Store tie-breaking record (supports both grand-total and per-item ties)
+     */
+    private function storeTieBreakingRecord($record, $tieInfo, $winner, $item = null): void
     {
         try {
             \DB::table('aoq_tie_breaking_records')->insert([
-                'procurement_id' => $record->id,
-                'aoq_number' => $record->procurement_id,
-                'method' => $tieInfo['method'],
-                'tied_amount' => $tieInfo['amount'],
-                'tied_suppliers_count' => $tieInfo['count'],
-                'tied_suppliers_data' => json_encode($tieInfo['suppliers']),
-                'winner_rfq_response_id' => $winner['rfq_response_id'],
-                'winner_supplier_name' => $winner['supplier_name'],
-                'seed_used' => crc32(time() . $record->id . $record->procurement_id),
-                'performed_at' => now(),
-                'performed_by' => auth()->id(),
-                'created_at' => now(),
-                'updated_at' => now(),
+                'procurement_id'        => $record->id,
+                'procurement_item_id'   => $item?->id,
+                'aoq_number'            => $record->procurement_id,
+                'method'                => $tieInfo['method'],
+                'tied_amount'           => $tieInfo['amount'],
+                'tied_suppliers_count'  => $tieInfo['count'],
+                'tied_suppliers_data'   => json_encode($tieInfo['suppliers']),
+                'winner_rfq_response_id'=> $winner['rfq_response_id'],
+                'winner_supplier_name'  => $winner['supplier_name'],
+                'seed_used'             => crc32($record->id . ($item?->id ?? '') . now()),
+                'performed_at'          => now(),
+                'performed_by'          => auth()->id(),
+                'created_at'            => now(),
+                'updated_at'            => now(),
             ]);
         } catch (\Exception $e) {
-            // Handle error silently
+            \Log::error('Failed to store tie-breaking record: ' . $e->getMessage());
         }
     }
 
@@ -410,89 +461,159 @@ class ViewAoq extends ViewRecord
     }
 
     // Detect tied lowest bids among qualified suppliers
-    private function detectTiedSuppliers($record): ?array
+    private function detectTiedSuppliers($record, $item = null): ?array
     {
-        $procurementItems = $record->procurementItems;
-        $rfqResponses = $record->rfqResponses;
-        
-        if ($procurementItems->isEmpty() || $rfqResponses->isEmpty()) {
+        $pr = Procurement::where('parent_id', $record->parent_id)
+            ->where('module', 'purchase_request')
+            ->first();
+
+        $basis = $pr?->basis ?? 'item';
+
+        // Handle Lot basis (grand total)
+        if ($basis === 'lot' && $item === null) {
+            $supplierTotals = [];
+            foreach ($record->rfqResponses as $rfqResponse) {
+                $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                    ->where('rfq_response_id', $rfqResponse->id)
+                    ->where('requirement', 'not like', 'quote_%')
+                    ->where('status', 'fail')
+                    ->exists();
+
+                if ($disqualified) continue;
+
+                $totalQuoted = $rfqResponse->quotes->sum('total_value');
+
+                $supplierTotals[] = [
+                    'rfq_response_id' => $rfqResponse->id,
+                    'supplier_name'   => $rfqResponse->supplier?->business_name ?? 'Unknown',
+                    'total_quoted'    => $totalQuoted,
+                ];
+            }
+
+            $qualified = collect($supplierTotals);
+            if ($qualified->isEmpty()) return null;
+
+            $lowest = $qualified->min('total_quoted');
+            $tied = $qualified->where('total_quoted', $lowest);
+
+            if ($tied->count() > 1) {
+                return [
+                    'count'   => $tied->count(),
+                    'amount'  => $lowest,
+                    'suppliers' => $tied->toArray(),
+                    'method'  => $tied->count() === 2 ? 'coin_toss' : 'random_draw'
+                ];
+            }
             return null;
         }
-        
-        // Calculate supplier totals
-        $supplierTotals = [];
-        foreach ($rfqResponses as $rfqResponse) {
-            $failedDocs = AoqEvaluation::where('procurement_id', $record->id)
-                ->where('rfq_response_id', $rfqResponse->id)
+
+        // Per-item basis
+        if (!$item) return null;
+
+        $quotes = $record->rfqResponses->flatMap->quotes
+            ->where('procurement_item_id', $item->id)
+            ->where('unit_value', '>', 0);
+
+        if ($quotes->isEmpty()) return null;
+
+        $data = [];
+        foreach ($quotes as $q) {
+            $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                ->where('rfq_response_id', $q->rfq_response_id)
                 ->where('requirement', 'not like', 'quote_%')
                 ->where('status', 'fail')
                 ->exists();
-            
-            $totalQuoted = $rfqResponse->quotes->sum('total_value');
-            
-            $supplierTotals[] = [
-                'rfq_response_id' => $rfqResponse->id,
-                'supplier_name' => $rfqResponse->supplier?->business_name ?? $rfqResponse->business_name ?? 'Unknown',
-                'total_quoted' => $totalQuoted,
-                'disqualified' => $failedDocs,
-            ];
+
+            if (!$disqualified) {
+                $data[] = [
+                    'rfq_response_id' => $q->rfq_response_id,
+                    'supplier_name'   => $q->rfqResponse->supplier?->business_name ?? 'Unknown',
+                    'unit_value'      => $q->unit_value,
+                ];
+            }
         }
-        
-        // Filter qualified suppliers
-        $qualifiedSuppliers = collect($supplierTotals)->where('disqualified', false);
-        
-        if ($qualifiedSuppliers->isEmpty()) {
-            return null;
-        }
-        
-        // Find lowest bid and check for ties
-        $lowestBid = $qualifiedSuppliers->min('total_quoted');
-        $lowestBidders = $qualifiedSuppliers->where('total_quoted', $lowestBid)->values();
-        
-        if ($lowestBidders->count() > 1) {
+
+        $qualified = collect($data);
+        if ($qualified->isEmpty()) return null;
+
+        $lowest = $qualified->min('unit_value');
+        $tied = $qualified->where('unit_value', $lowest);
+
+        if ($tied->count() > 1) {
             return [
-                'count' => $lowestBidders->count(),
-                'amount' => $lowestBid,
-                'suppliers' => $lowestBidders->toArray(),
-                'method' => $lowestBidders->count() === 2 ? 'coin_toss' : 'random_draw'
+                'item'    => $item,
+                'count'   => $tied->count(),
+                'amount'  => $lowest,
+                'suppliers' => $tied->toArray(),
+                'method'  => $tied->count() === 2 ? 'coin_toss' : 'random_draw'
             ];
         }
-        
+
         return null;
     }
 
     // Perform tie-breaking using coin toss or random draw
-    private function performTieBreaking($tieInfo, $record)
+    private function performTieBreaking($tieInfo, $record, $item = null)
     {
-        // Set random seed for reproducibility
-        $seed = time() . $record->id . $record->procurement_id;
-        mt_srand(crc32($seed));
-        
+        $seed = crc32($record->id . ($item?->id ?? '') . time());
+        mt_srand($seed);
+
         $suppliers = collect($tieInfo['suppliers']);
         
-        if ($tieInfo['method'] === 'coin_toss') {
-            // Coin toss for two suppliers
-            $winnerIndex = mt_rand(0, 1);
-            return $suppliers[$winnerIndex];
-        } else {
-            // Random draw for multiple suppliers
-            $winnerIndex = mt_rand(0, $suppliers->count() - 1);
-            return $suppliers[$winnerIndex];
+        if ($suppliers->isEmpty()) {
+            throw new \Exception('No suppliers found for tie-breaking');
         }
+        
+        // FIX: Use proper array indexing
+        if ($tieInfo['method'] === 'coin_toss') {
+            if ($suppliers->count() < 2) {
+                throw new \Exception('Coin toss requires exactly 2 suppliers');
+            }
+            $winnerIndex = mt_rand(0, 1);
+        } else {
+            $winnerIndex = mt_rand(0, $suppliers->count() - 1);
+        }
+        
+        // FIX: Use values() to reset array keys before accessing by index
+        $suppliersArray = $suppliers->values();
+        
+        if (!isset($suppliersArray[$winnerIndex])) {
+            throw new \Exception("Invalid winner index: {$winnerIndex}");
+        }
+
+        return $suppliersArray[$winnerIndex];
     }
 
-    // Check for unresolved ties
     private function hasUnresolvedTies($record): bool
     {
-        $tieInfo = $this->detectTiedSuppliers($record);
-        
-        if (!$tieInfo) {
-            return false;
+        $pr = Procurement::where('parent_id', $record->parent_id)
+            ->where('module', 'purchase_request')
+            ->first();
+
+        $basis = $pr?->basis ?? 'item';
+
+        if ($basis === 'lot') {
+            $tie = $this->detectTiedSuppliers($record);
+            if (!$tie) return false;
+            return !\DB::table('aoq_tie_breaking_records')
+                ->where('procurement_id', $record->id)
+                ->whereNull('procurement_item_id')
+                ->exists();
         }
-        
-        return !\DB::table('aoq_tie_breaking_records')
-            ->where('procurement_id', $record->id)
-            ->exists();
+
+        // Per-item: check each item
+        foreach ($record->procurementItems as $item) {
+            $tie = $this->detectTiedSuppliers($record, $item);
+            if ($tie) {
+                $resolved = \DB::table('aoq_tie_breaking_records')
+                    ->where('procurement_id', $record->id)
+                    ->where('procurement_item_id', $item->id)
+                    ->exists();
+                if (!$resolved) return true;
+            }
+        }
+
+        return false;
     }
 
     // Get RFQ response form schema
@@ -721,107 +842,113 @@ class ViewAoq extends ViewRecord
                 ->schema([
                     Repeater::make('quotes')
                         ->schema([
-                            Forms\Components\Hidden::make('procurement_item_id')
-                                ->required(),
+                            Forms\Components\Hidden::make('procurement_item_id')->required(),
+                            Forms\Components\Hidden::make('total_value')
+                            ->default(0),
 
-                            Forms\Components\Grid::make(2)
+                            Forms\Components\Grid::make(1)
                                 ->schema([
-                                    Forms\Components\Group::make()
+                                
+                                    Forms\Components\Grid::make(12) 
                                         ->schema([
+                                            // 1. Item No. / Lot No.
                                             TextInput::make('item_no')
-                                                ->label(fn () => $this->record->parent->children()->where('module', 'purchase_request')->first()->basis === 'lot' ? 'Lot No.' : 'Item No.')
+                                                ->label(fn ($livewire) => 
+                                                    $livewire->record
+                                                        ->parent
+                                                        ->children()
+                                                        ->where('module', 'purchase_request')
+                                                        ->first()?->basis === 'lot'
+                                                        ? 'Lot No.'
+                                                        : 'Item No.'
+                                                )
                                                 ->numeric()
-                                                ->readOnly(),
-                                            TextInput::make('unit')
-                                                ->label('Unit')
-                                                ->readOnly(),
-                                            Textarea::make('item_description')
-                                                ->label(fn () => $this->record->parent->children()->where('module', 'purchase_request')->first()->basis === 'lot' ? 'Lot Description' : 'Item Description')
+                                                
                                                 ->readOnly()
-                                                ->rows(2),
-                                        ])
-                                        ->columnSpan(1),
+                                                ->columnSpan(1),
 
-                                    Forms\Components\Group::make()
-                                        ->schema([
+                                            // 2. Unit Value (Price)
                                             TextInput::make('unit_value')
                                                 ->label('Unit Value')
                                                 ->numeric()
                                                 ->prefix('₱')
                                                 ->required()
-                                                ->minValue(0)
+                                                ->minValue(0.01)
+                                                ->step(0.01)
                                                 ->reactive()
                                                 ->afterStateUpdated(function ($state, callable $set, callable $get) {
-                                                    $quantity = $get('quantity') ?? 1;
-                                                    $set('total_value', (float) $state * (float) $quantity);
-                                                }),
-                                            TextInput::make('total_value')
-                                                ->label('Total Value')
-                                                ->numeric()
-                                                ->prefix('₱')
-                                                ->required()
-                                                ->minValue(0)
-                                                ->readOnly(),
+                                                    // Get the procurement item to fetch quantity
+                                                    $procurementItemId = $get('procurement_item_id');
+                                                    if ($procurementItemId && $state) {
+                                                        $item = ProcurementItem::find($procurementItemId);
+                                                        if ($item) {
+                                                            $totalValue = $state * $item->quantity;
+                                                            $set('total_value', $totalValue);
+                                                        }
+                                                    }
+                                                })
+                                                ->columnSpan(2),
+                                            // 3. Item / Lot Description
+                                            Textarea::make('item_description')
+                                                ->label(fn ($livewire) => 
+                                                    $livewire->record
+                                                        ->parent
+                                                        ->children()
+                                                        ->where('module', 'purchase_request')
+                                                        ->first()?->basis === 'lot'
+                                                        ? 'Lot Description'
+                                                        : 'Item Description'
+                                                )
+                                                ->readOnly()
+                                                ->rows(2)
+                                                ->columnSpan(4),
+
+                                            // 4. Specifications (Brand/Model/Others)
                                             Textarea::make('specifications')
                                                 ->label('Specifications (Brand/Model/Others)')
+                                                ->required()
                                                 ->rows(2)
-                                                ->required(),
-                                        ])
-                                        ->columnSpan(1),
-                                ]),
+                                                ->columnSpan(4),
 
-                            Forms\Components\Grid::make(2)
-                                ->schema([
-                                    Forms\Components\Group::make()
-                                        ->schema([
-                                            TextInput::make('quantity')
-                                                ->label('Quantity')
-                                                ->numeric()
-                                                ->readOnly(),
-                                            TextInput::make('total_cost')
-                                                ->label('Total ABC')
-                                                ->numeric()
-                                                ->prefix('₱')
-                                                ->readOnly(),
-                                        ])
-                                        ->columnSpan(1),
-
-                                    Forms\Components\Group::make()
-                                        ->schema([
+                                            // 5. Complies Toggle
                                             Toggle::make('statement_of_compliance')
                                                 ->label('Complies')
                                                 ->required()
-                                                ->default(true),
+                                                ->default(true)
+                                                ->inline(false)
+                                                ->columnSpan(1)
+                                                ->extraAttributes(['class' => 'items-center']),
                                         ])
-                                        ->columnSpan(1)
-                                        ->extraAttributes(['class' => 'ml-auto']),
+                                        ->extraAttributes([
+                                            'class' => 'overflow-x-auto pb-2', 
+                                        ])
+                                        ->columnSpanFull(),
                                 ]),
                         ])
-                        ->default(function () {
-                            $procurementId = $this->getProcurementIdForItems();
+                        ->default(function ($livewire) {
+                            $procurementId = $livewire->getProcurementIdForItems();
+
                             return ProcurementItem::where('procurement_id', $procurementId)
                                 ->orderBy('sort')
                                 ->get()
                                 ->map(fn ($item) => [
-                                    'procurement_item_id' => $item->id,
-                                    'item_no' => $item->sort,
-                                    'unit' => $item->unit,
-                                    'quantity' => $item->quantity,
-                                    'item_description' => $item->item_description,
-                                    'total_cost' => $item->total_cost,
+                                    'procurement_item_id'     => $item->id,
+                                    'item_no'                 => $item->sort,
+                                    'item_description'        => $item->item_description,
+                                    'unit_value'              => null,
+                                    'specifications'          => null,
                                     'statement_of_compliance' => true,
-                                    'specifications' => null,
-                                    'unit_value' => null,
-                                    'total_value' => null,
+                                    
                                 ])
                                 ->toArray();
                         })
                         ->addable(false)
                         ->deletable(false)
-                        ->reorderable(false),
+                        ->reorderable(false)
                 ]),
-        ];
-    }
+
+            ];
+        }
 
     protected function getProcurementIdForItems(): int
     {
@@ -999,12 +1126,22 @@ class ViewAoq extends ViewRecord
 
         foreach ($quotes as $quoteData) {
             if (isset($quoteData['procurement_item_id'])) {
-                $rfqResponse->quotes()->updateOrCreate(
-                    ['procurement_item_id' => $quoteData['procurement_item_id']],
-                    collect($quoteData)->only([
-                        'unit_value', 'total_value', 'specifications', 'statement_of_compliance'
-                    ])->toArray()
-                );
+                $procurementItem = ProcurementItem::find($quoteData['procurement_item_id']);
+                
+                if ($procurementItem) {
+                    $unitValue = $quoteData['unit_value'] ?? 0;
+                    $totalValue = $unitValue * $procurementItem->quantity;
+                    
+                    $rfqResponse->quotes()->updateOrCreate(
+                        ['procurement_item_id' => $quoteData['procurement_item_id']],
+                        [
+                            'unit_value' => $unitValue,
+                            'total_value' => $totalValue, // Explicitly calculate total
+                            'specifications' => $quoteData['specifications'] ?? null,
+                            'statement_of_compliance' => $quoteData['statement_of_compliance'] ?? true,
+                        ]
+                    );
+                }
             }
         }
 
@@ -1275,8 +1412,8 @@ class ViewAoq extends ViewRecord
                                 if (Carbon::now()->lessThan($record->bid_opening_datetime)) {
                                     return 'Evaluations can start on ' . $record->bid_opening_datetime->format('Y-m-d h:i A') . '.';
                                 }
+
                                 
-                                // Show "No RFQ responses" if no responses exist after bid opening
                                 if ($record->rfqResponses->isEmpty()) {
                                     return 'No RFQ responses documented yet.';
                                 }
@@ -1295,7 +1432,7 @@ class ViewAoq extends ViewRecord
                             ->label('')
                             ->html()
                             ->getStateUsing(function ($record) use ($isLot, $numberLabel, $descriptionLabel) {
-                                // Only show supplier list after bid opening AND if responses exist
+
                                 if (is_null($record->bid_opening_datetime) || 
                                     Carbon::now()->lessThan($record->bid_opening_datetime) ||
                                     $record->rfqResponses->isEmpty()) {
@@ -1308,7 +1445,8 @@ class ViewAoq extends ViewRecord
                                     }
                                 ]);
 
-                                $html = '';
+                                // UPDATED: Changed to use responsive wrapper with overflow-x-auto
+                                $html = '<div class="supplier-cards-wrapper w-full"><div class="w-full" style="display: flex; flex-direction: column; gap: 1rem;">';
                                 $hasAnyEvaluations = AoqEvaluation::where('procurement_id', $record->id)->exists();
 
                                 // Compute evaluation completeness
@@ -1326,6 +1464,112 @@ class ViewAoq extends ViewRecord
                                 
                                 $evaluationComplete = $totalDocs > 0 && $evaluatedDocs >= $totalDocs;
 
+                                // Get PR basis
+                                $pr = Procurement::where('parent_id', $record->parent_id)
+                                    ->where('module', 'purchase_request')
+                                    ->first();
+                                $basis = $pr?->basis ?? 'item';
+
+                                // Show per-item comparison table if basis is 'item'
+                                if ($basis === 'item' && $evaluationComplete) {
+                                    // UPDATED: Added responsive wrapper and proper overflow handling
+                                    $html .= '<div class="w-full mb-6">';
+                                    $html .= '<h3 class="text-xl font-bold mb-4">Quote Comparison by Item</h3>';
+                                    $html .= '<div class="w-full overflow-x-auto">';
+                                    $html .= '<table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700" style="width: 1170px;">';
+                                    $html .= '<thead class="bg-gray-50 dark:bg-gray-700">';
+                                    $html .= '<tr>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">' . $numberLabel . '</th>';
+                                    $html .= '<th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">' . $descriptionLabel . '</th>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">Qty</th>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">Unit</th>';
+                                    $html .= '<th class="px-3 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">ABC Unit</th>';
+
+                                    
+                                    foreach ($record->rfqResponses as $rfqResponse) {
+                                        $supplierName = $rfqResponse->supplier?->business_name ?? 'Unknown';
+                                        $html .= '<th class="px-3 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">' . e($supplierName) . '</th>';
+                                    }
+                                    $html .= '</tr>';
+                                    $html .= '</thead>';
+                                    $html .= '<tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">';
+
+                                    
+                                    foreach ($record->procurementItems as $item) {
+                                        $html .= '<tr>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top">' . e($item->sort) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm align-top">' . e($item->item_description) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top whitespace-nowrap">' . e($item->quantity) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top whitespace-nowrap">' . e($item->unit) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-right align-top whitespace-nowrap">₱' . number_format($item->unit_cost, 2) . '</td>';
+
+                                    
+                                        foreach ($record->rfqResponses as $rfqResponse) {
+                                            $quote = $rfqResponse->quotes->firstWhere('procurement_item_id', $item->id);
+                                            
+                                        
+                                            $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                                                ->where('rfq_response_id', $rfqResponse->id)
+                                                ->where('requirement', 'not like', 'quote_%')
+                                                ->where('status', 'fail')
+                                                ->exists();
+
+                                           
+                                                $isWinner = false;
+                                            if (!$disqualified && $quote) {
+                                                $evaluation = AoqEvaluation::where('procurement_id', $record->id)
+                                                    ->where('rfq_response_id', $rfqResponse->id)
+                                                    ->where('requirement', 'quote_' . $item->id)
+                                                    ->where('lowest_bid', true)
+                                                    ->exists();
+                                                $isWinner = $evaluation;
+                                            }
+
+                                            if ($quote && !$disqualified) {
+                                                $bgClass = $isWinner ? 'bg-green-100 dark:bg-green-900/30' : '';
+                                                $html .= '<td class="px-3 py-3 text-sm text-right align-top font-semibold whitespace-nowrap ' . $bgClass . '">';
+                                                $html .= '₱' . number_format($quote->unit_value, 2);
+                                                if ($isWinner) {
+                                                    $html .= ' <span class="ml-1 text-green-600 dark:text-green-400 text-lg">🏆</span>';
+                                                }
+                                                $html .= '</td>';
+                                            } elseif ($disqualified) {
+                                                $html .= '<td class="px-3 py-3 text-sm text-center align-top text-red-500 whitespace-nowrap">❌</td>';
+                                            } else {
+                                                $html .= '<td class="px-3 py-3 text-sm text-center align-top text-gray-400">—</td>';
+                                            }
+                                        }
+                                        $html .= '</tr>';
+                                    }
+
+                                    // Add total row
+                                    $html .= '<tr class="bg-gray-50 dark:bg-gray-700 font-bold">';
+                                    $html .= '<td colspan="4" class="px-3 py-3 text-sm text-right">Grand Total:</td>';
+                                    $html .= '<td class="px-3 py-3 text-sm text-right whitespace-nowrap">₱' . number_format($record->procurementItems->sum('total_cost'), 2) . '</td>';
+                                    
+                                    foreach ($record->rfqResponses as $rfqResponse) {
+                                        $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                                            ->where('rfq_response_id', $rfqResponse->id)
+                                            ->where('requirement', 'not like', 'quote_%')
+                                            ->where('status', 'fail')
+                                            ->exists();
+
+                                        if (!$disqualified) {
+                                            $totalQuoted = $rfqResponse->quotes->sum('total_value');
+                                            $html .= '<td class="px-3 py-3 text-sm text-right whitespace-nowrap">₱' . number_format($totalQuoted, 2) . '</td>';
+                                        } else {
+                                            $html .= '<td class="px-3 py-3 text-sm text-center text-red-500">—</td>';
+                                        }
+                                    }
+                                    $html .= '</tr>';
+
+                                    $html .= '</tbody>';
+                                    $html .= '</table>';
+                                    $html .= '</div>'; // Close overflow-x-auto
+                                    $html .= '</div>'; // Close w-full mb-6
+                                }
+
+                                // Individual supplier cards
                                 foreach ($record->rfqResponses as $rfqResponse) {
                                     $supplierName = $rfqResponse->supplier?->business_name ?? $rfqResponse->business_name ?? 'Unknown Supplier';
 
@@ -1340,26 +1584,36 @@ class ViewAoq extends ViewRecord
                                     $docEvals = $evaluations->keyBy('requirement');
                                     $hasFailedDocs = $evaluations->where('status', 'fail')->isNotEmpty();
 
-                                    // Only show winning bids if evaluations are complete
+
                                     $hasWinningBids = $evaluationComplete && $hasAnyEvaluations && AoqEvaluation::where('procurement_id', $record->id)
                                         ->where('rfq_response_id', $rfqResponse->id)
                                         ->where('lowest_bid', true)
                                         ->exists();
 
-                                    $html .= '<div class="border rounded-lg p-6 mb-6 bg-white dark:bg-gray-800">';
+                                    // UPDATED: Removed fixed width, added max-width and responsive wrapper
+                                    $html .= '<div class="border rounded-lg p-4 mb-4 bg-white dark:bg-gray-800" style="min-width: 600px; width: 100%;">';
                                     $html .= '<div class="flex items-center justify-between mb-4">';
                                     $html .= '<h3 class="text-xl font-bold">' . e($supplierName) . '</h3>';
 
                                     if ($hasFailedDocs) {
                                         $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100">❌ DISQUALIFIED</span>';
                                     } elseif ($hasWinningBids) {
-                                        $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID</span>';
+                                        if ($basis === 'item') {
+                                            $winningItemsCount = AoqEvaluation::where('procurement_id', $record->id)
+                                                ->where('rfq_response_id', $rfqResponse->id)
+                                                ->where('lowest_bid', true)
+                                                ->count();
+                                            $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID (' . $winningItemsCount . ' items)</span>';
+                                        } else {
+                                            $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID</span>';
+                                        }
                                     }
 
                                     $html .= '</div>';
 
+                                    // Document Evaluation Section
                                     $html .= '<div class="mb-6">';
-                                    $html .= '<details class="border rounded-lg" open>';
+                                    $html .= '<details class="border rounded-lg">';
                                     $html .= '<summary class="cursor-pointer p-4 font-semibold bg-gray-50 dark:bg-gray-700">Document Evaluation</summary>';
                                     $html .= '<div class="p-4">';
                                     
@@ -1448,71 +1702,22 @@ class ViewAoq extends ViewRecord
 
                                     $html .= '</div></details></div>';
 
-                                    $html .= '<div class="mb-6">';
-                                    $html .= '<details class="border rounded-lg" open>';
-                                    $html .= '<summary class="cursor-pointer p-4 font-semibold bg-gray-50 dark:bg-gray-700">Quote Comparison</summary>';
-                                    $html .= '<div class="p-4">';
-
-                                    if ($rfqResponse->quotes->count() > 0) {
-                                        $html .= '<div class="overflow-x-auto"><table class="w-full divide-y divide-gray-200 dark:divide-gray-700" style="table-layout: fixed;">';
-                                        $html .= '<thead class="bg-gray-50 dark:bg-gray-700"><tr>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 6%;">' . $numberLabel . '</th>';
-                                        $html .= '<th class="px-2 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 22%;">' . $descriptionLabel . '</th>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 6%;">Qty</th>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 8%;">Unit</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 13%;">ABC Unit</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 13%;">ABC Total</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 14%;">Unit Price</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 18%;">Total</th>';
-                                        $html .= '</tr></thead>';
-                                        $html .= '<tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">';
-
-                                        foreach ($rfqResponse->quotes as $quote) {
-                                            if (!$quote->procurementItem) continue;
-                                            
-                                            $item = $quote->procurementItem;
-                                            $evaluation = AoqEvaluation::where('procurement_id', $record->id)
-                                                ->where('rfq_response_id', $rfqResponse->id)
-                                                ->where('requirement', 'quote_' . $item->id)
-                                                ->first();
-                                            $isLowest = $evaluation?->lowest_bid ?? false;
-
-                                            $html .= '<tr class="' . ($isLowest ? 'bg-green-50 dark:bg-green-900/20' : '') . '">';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->sort) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm align-top" style="word-wrap: break-word; word-break: break-word;">' . e($item->item_description) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->quantity) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->unit) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right align-top">₱' . number_format($item->unit_cost, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right align-top">₱' . number_format($item->total_cost, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right font-semibold align-top">₱' . number_format($quote->unit_value, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right font-semibold align-top">₱' . number_format($quote->total_value, 2) . '</td>';
-                                            $html .= '</tr>';
-                                        }
-
-                                        $html .= '</tbody></table></div>';
-                                    } else {
-                                        $html .= '<p class="text-gray-500">No quotes submitted</p>';
-                                    }
-
-                                    $html .= '</div></details></div>';
-
                                     $totalQuoted = $rfqResponse->quotes->sum('total_value');
                                     $html .= '<div class="mt-4 text-right">';
                                     $html .= '<span class="text-lg font-bold">Total Quoted Amount: ₱' . number_format($totalQuoted, 2) . '</span>';
-                                    $html .= '</div></div>';
+                                    $html .= '</div></div>'; // Close supplier card divs
                                 }
 
+                                $html .= '</div></div>'; // Close wrapper divs
                                 return $html;
                             })
                             ->visible(function ($record) {
-                                // Only show supplier list after bid opening AND if responses exist
                                 return !is_null($record->bid_opening_datetime) && 
                                     Carbon::now()->greaterThanOrEqualTo($record->bid_opening_datetime) &&
                                     $record->rfqResponses->isNotEmpty();
                             })
                             ->columnSpanFull(),
-                    ]),
-
+                    ]),  
                 Section::make('Approval Stages')
                     ->collapsible()
                     ->collapsed(false)
@@ -1745,14 +1950,22 @@ class ViewAoq extends ViewRecord
                     $data['procurement_id'] = $rfq->id;
                     $rfqResponse = RfqResponse::create($data);
 
+                    // Load procurement items to get quantity for total calculation
                     foreach ($quotes as $quoteData) {
-                        $rfqResponse->quotes()->create([
-                            'procurement_item_id' => $quoteData['procurement_item_id'],
-                            'unit_value'          => $quoteData['unit_value'] ?? 0,
-                            'total_value'         => $quoteData['total_value'] ?? 0,
-                            'specifications'      => $quoteData['specifications'] ?? null,
-                            'statement_of_compliance' => $quoteData['statement_of_compliance'] ?? true,
-                        ]);
+                        $procurementItem = ProcurementItem::find($quoteData['procurement_item_id']);
+                        
+                        if ($procurementItem) {
+                            $unitValue = $quoteData['unit_value'] ?? 0;
+                            $totalValue = $unitValue * $procurementItem->quantity;
+                            
+                            $rfqResponse->quotes()->create([
+                                'procurement_item_id' => $quoteData['procurement_item_id'],
+                                'unit_value'          => $unitValue,
+                                'total_value'         => $totalValue, // Explicitly calculate total
+                                'specifications'      => $quoteData['specifications'] ?? null,
+                                'statement_of_compliance' => $quoteData['statement_of_compliance'] ?? true,
+                            ]);
+                        }
                     }
 
                     ActivityLogger::log(
@@ -1768,7 +1981,7 @@ class ViewAoq extends ViewRecord
                         ->success()
                         ->send();
 
-                        $this->dispatch('$refresh');
+                    $this->dispatch('$refresh');
 
                     redirect()->route('filament.admin.resources.procurements.view-aoq', $this->record->parent_id);
                 })
@@ -1905,58 +2118,93 @@ class ViewAoq extends ViewRecord
                 ->icon('heroicon-o-play')
                 ->color('warning')
                 ->requiresConfirmation()
-                ->modalHeading('🎲 Resolve Tied Bids')
+                ->modalHeading('Resolve Tied Bids')
                 ->modalDescription(function () {
-                    $tieInfo = $this->detectTiedSuppliers($this->record);
-                    if (!$tieInfo) return 'No tie detected.';
-                    
-                    $method = $tieInfo['method'] === 'coin_toss' ? 'coin toss' : 'random draw';
-                    $suppliers = collect($tieInfo['suppliers'])->pluck('supplier_name')->join(', ', ' and ');
-                    
-                    return sprintf(
-                        '%d suppliers are tied at ₱%s: %s. Click "Start" to perform a %s and determine the winner.',
-                        $tieInfo['count'],
-                        number_format($tieInfo['amount'], 2),
-                        $suppliers,
-                        $method
-                    );
-                })
-                ->modalSubmitActionLabel('🎲 Start Tie-Breaking')
-                ->action(function () {
-                    $tieInfo = $this->detectTiedSuppliers($this->record);
-                    
-                    if (!$tieInfo) {
-                        Notification::make()
-                            ->title('No Tie Detected')
-                            ->body('There are no tied bids to resolve.')
-                            ->warning()
-                            ->send();
-                        return;
+                    $pr = Procurement::where('parent_id', $this->record->parent_id)
+                        ->where('module', 'purchase_request')
+                        ->first();
+                    $basis = $pr?->basis ?? 'item';
+
+                    if ($basis === 'lot') {
+                        $tie = $this->detectTiedSuppliers($this->record);
+                        if (!$tie) return 'No tie detected.';
+                        $names = collect($tie['suppliers'])->pluck('supplier_name')->join(', ', ' and ');
+                        return "Grand Total Tie: {$tie['count']} suppliers tied at ₱" . number_format($tie['amount'],2) . ": {$names}";
                     }
-                    
-                    // Perform tie-breaking and update evaluations
-                    $winner = $this->performTieBreaking($tieInfo, $this->record);
-                    $this->storeTieBreakingRecord($this->record, $tieInfo, $winner);
-                    $this->detectLowestBids($this->record);
-                    
-                    Notification::make()
-                        ->title('🏆 Tie-Breaking Complete!')
-                        ->body(sprintf(
-                            'Winner: %s (₱%s) - Determined by %s',
-                            $winner['supplier_name'],
-                            number_format($winner['total_quoted'], 2),
-                            $tieInfo['method'] === 'coin_toss' ? 'Coin Toss' : 'Random Draw'
-                        ))
-                        ->success()
-                        ->duration(8000)
-                        ->send();
-                    
-                    return redirect()->route('filament.admin.resources.procurements.view-aoq', ['record' => $this->record->parent_id]);
+
+                    // Find first unresolved per-item tie
+                    foreach ($this->record->procurementItems as $item) {
+                        $tie = $this->detectTiedSuppliers($this->record, $item);
+                        if ($tie && !\DB::table('aoq_tie_breaking_records')
+                            ->where('procurement_id', $this->record->id)
+                            ->where('procurement_item_id', $item->id)
+                            ->exists()
+                        ) {
+                            $names = collect($tie['suppliers'])->pluck('supplier_name')->join(', ', ' and ');
+                            return "Item #{$item->sort}: {$tie['count']} suppliers tied at ₱" . number_format($tie['amount'],2) . ": {$names}";
+                        }
+                    }
+                    return 'No unresolved ties.';
                 })
-                ->visible(function () use ($isLocked, $isEvaluated, $hasUnresolvedTies, $evaluationComplete) {
-                    return !$isLocked && $isEvaluated && $evaluationComplete && $hasUnresolvedTies;
+                ->modalSubmitActionLabel('Start Tie-Breaking')
+                ->action(function () {
+                    $pr = Procurement::where('parent_id', $this->record->parent_id)
+                        ->where('module', 'purchase_request')
+                        ->first();
+                    $basis = $pr?->basis ?? 'item';
+
+                    if ($basis === 'lot') {
+                        $tieInfo = $this->detectTiedSuppliers($this->record);
+                        $item = null;
+                        
+                        if (!$tieInfo) {
+                            Notification::make()->title('No Tie')->warning()->send();
+                            return;
+                        }
+
+                        $winner = $this->performTieBreaking($tieInfo, $this->record, null);
+                        $this->storeTieBreakingRecord($this->record, $tieInfo, $winner, null);
+                    } else {
+                        // Find first unresolved item tie
+                        $tieInfo = null;
+                        $item = null;
+                        
+                        foreach ($this->record->procurementItems as $procItem) {
+                            $tieInfo = $this->detectTiedSuppliers($this->record, $procItem);
+                            if ($tieInfo && !\DB::table('aoq_tie_breaking_records')
+                                ->where('procurement_id', $this->record->id)
+                                ->where('procurement_item_id', $procItem->id)
+                                ->exists()
+                            ) {
+                                $item = $procItem;
+                                break;
+                            }
+                        }
+
+                        if (!$tieInfo || !$item) {
+                            Notification::make()->title('No Tie')->warning()->send();
+                            return;
+                        }
+
+                        $winner = $this->performTieBreaking($tieInfo, $this->record, $item);
+                        $this->storeTieBreakingRecord($this->record, $tieInfo, $winner, $item);
+                    }
+
+                    // Re-run detection to update evaluations
+                    $this->detectLowestBids($this->record);
+
+                    Notification::make()
+                        ->title('Tie-Breaking Complete!')
+                        ->body("Winner for " . ($item ? "Item #{$item->sort}" : "Grand Total") . ": {$winner['supplier_name']}")
+                        ->success()
+                        ->send();
+
+                    return redirect()->route('filament.admin.resources.procurements.view-aoq', $this->record->parent_id);
+                })
+                ->visible(function () use ($isLocked, $isEvaluated, $evaluationComplete) {
+                    return !$isLocked && $isEvaluated && $evaluationComplete && $this->hasUnresolvedTies($this->record);
                 }),
-            
+
             Action::make('viewTieBreaking')
                 ->label('View Tie-Breaking Details')
                 ->icon('heroicon-o-clipboard-document-check')
@@ -1965,23 +2213,16 @@ class ViewAoq extends ViewRecord
                     return $hasTieBreakingRecord;
                 })
                 ->modalContent(function () {
-                    $tieRecord = \DB::table('aoq_tie_breaking_records')
+                    $records = \DB::table('aoq_tie_breaking_records')
                         ->where('procurement_id', $this->record->id)
-                        ->latest()
-                        ->first();
-                    
-                    if (!$tieRecord) {
-                        return view('filament.components.empty-state', [
-                            'message' => 'No tie-breaking record found.'
-                        ]);
+                        ->orderByDesc('performed_at')
+                        ->get();
+
+                    if ($records->isEmpty()) {
+                        return view('filament.components.empty-state', ['message' => 'No tie-breaking records.']);
                     }
 
-                    $tiedSuppliers = json_decode($tieRecord->tied_suppliers_data, true);
-
-                    return view('filament.components.tie-breaking-details', [
-                        'record' => $tieRecord,
-                        'suppliers' => $tiedSuppliers,
-                    ]);
+                    return view('filament.components.tie-breaking-details-multiple', compact('records'));
                 })
                 ->modalWidth('3xl')
                 ->slideOver()
@@ -2061,12 +2302,21 @@ class ViewAoq extends ViewRecord
                 }),
 
                 Action::make('viewPdf')
-                ->label('View PDF')
-                ->icon('heroicon-o-document-text')
-                ->url(fn () => route('procurements.aoq.pdf', $this->record->parent_id), true)
-                ->openUrlInNewTab()
-                ->color('info'),
-        ];
+    ->label('View PDF')
+    ->icon('heroicon-o-document-text')
+    ->url(fn () => route('procurements.aoq.pdf', $this->record->parent_id), true)
+    ->openUrlInNewTab()
+    ->color('info')
+    ->disabled(fn () =>
+    !in_array($this->record->status, ['Evaluated','Locked', 'Approved', 'Rejected'])
+)
+
+    ->tooltip(fn () =>
+        $this->record->status !== 'Locked'
+            ? 'AOQ must be locked before generating PDF'
+            : null
+    ),
+];
     }
 
     // Generate form schema for supplier evaluation

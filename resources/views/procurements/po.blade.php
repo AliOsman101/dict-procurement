@@ -73,6 +73,58 @@
 </head>
 <body>
 
+    <!-- Signatories -->
+@php
+use App\Models\DefaultApprover;
+use Illuminate\Support\Facades\Crypt;
+
+// Get all default PO approvers
+$budgetOfficer     = $defaultApprovers->firstWhere('sequence', 1);
+$accountant        = $defaultApprovers->firstWhere('sequence', 2);
+$regionalDirector  = $defaultApprovers->firstWhere('sequence', 3);
+@endphp
+
+
+
+@php
+if (!function_exists('po_signatory_block')) {
+    function po_signatory_block($approver, $fallbackLabel) {
+
+        if (!$approver) {
+            return '
+                <div class="signature-container"></div>
+                <span class="underline">_______________________</span><br>
+                <i>' . $fallbackLabel . '</i>
+            ';
+        }
+
+        $employee = $approver->employee;
+        $name = strtoupper($employee->full_name ?? 'NOT SET');
+        $designation = $approver->designation ?? $fallbackLabel;
+
+        $signature = null;
+        if ($employee?->certificate?->signature_image_path) {
+            try {
+                $signature = Crypt::decryptString($employee->certificate->signature_image_path);
+            } catch (\Exception $e) {
+                $signature = null;
+            }
+        }
+
+        return '
+            <div class="signature-container">
+                ' . ($signature ? '<img class="signature-img" src="data:image/png;base64,' . $signature . '">' : '') . '
+            </div>
+            <span class="underline">' . $name . '</span><br>
+            <i>' . $designation . '</i>
+        ';
+    }
+}
+@endphp
+
+
+    
+
     <!-- Header with Logo and Text -->
     <div style="text-align:center; margin:0; padding:0;">
 
@@ -121,84 +173,79 @@
         </tr>
     </table>
 
-    @php
-        // Get parent and related procurements
-        $parent = $procurement->parent;
-        $aoq = $parent ? $parent->children()->where('module', 'abstract_of_quotation')->first() : null;
-        $rfq = $parent ? $parent->children()->where('module', 'request_for_quotation')->first() : null;
-        $pr = $parent ? $parent->children()->where('module', 'purchase_request')->first() : null;
-        
-        // Get winning supplier from AOQ
-        $winningSupplier = null;
-        $supplierAddress = '';
-        $supplierTin = '';
-        $supplierVat = false;
-        $winnerRfqResponse = null;
-        
-        if ($aoq) {
-            $tieBreakingRecord = \DB::table('aoq_tie_breaking_records')
-                ->where('procurement_id', $aoq->id)
-                ->first();
-            
-            if ($tieBreakingRecord) {
-                $winnerRfqResponse = \App\Models\RfqResponse::with(['supplier', 'quotes.procurementItem'])
-                    ->find($tieBreakingRecord->winner_rfq_response_id);
-            } else {
-                $winningEvaluation = \App\Models\AoqEvaluation::where('procurement_id', $aoq->id)
-                    ->where('lowest_bid', true)
-                    ->with(['rfqResponse.supplier', 'rfqResponse.quotes.procurementItem'])
-                    ->first();
-                
-                $winnerRfqResponse = $winningEvaluation?->rfqResponse;
-            }
-            
-            if ($winnerRfqResponse) {
-                $supplier = $winnerRfqResponse->supplier;
-                $winningSupplier = $supplier?->business_name ?? $winnerRfqResponse->business_name ?? 'Unknown Supplier';
-                $supplierAddress = $supplier?->business_address ?? '';
-                $supplierTin = $supplier?->tin ?? '';
-                $supplierVat = $supplier?->vat ?? false;
-            }
-        }
-        
-        // Format TIN with VAT/NON-VAT prefix
-        $tinDisplay = '';
-        if ($supplierTin) {
-            $tinDisplay = ($supplierVat ? 'VAT ' : 'NON-VAT ') . $supplierTin;
-        }
-        
-        // Get delivery term from RFQ
-        $deliveryTerm = 'Not set';
-        if ($rfq) {
-            if ($rfq->delivery_mode === 'days' && $rfq->delivery_value) {
-                $deliveryTerm = "within {$rfq->delivery_value} calendar days upon receipt of Purchase Order";
-            } elseif ($rfq->delivery_mode === 'date' && $rfq->delivery_value) {
-                $deliveryTerm = \Carbon\Carbon::parse($rfq->delivery_value)->format('F j, Y');
-            }
-        }
-        
-        // Procurement Type
-        $procurementType = $procurement->procurement_type === 'small_value_procurement' 
-        ? 'Small Value Procurement' 
-        : 'Public Bidding';
-        
-        // Get items from PR
-        $items = $pr ? $pr->items()->orderBy('sort')->get() : collect();
-        $isLot = $pr && $pr->basis === 'lot';
-        
-        // Get ABC (from PR)
-        $abc = $pr ? $pr->grand_total : 0;
-        
-        // Get PO Approvals with Signatures
-        $poApprovals = $procurement->approvals()
-            ->where('module', 'purchase_order')
-            ->orderBy('sequence')
-            ->with('employee.certificate')
-            ->get();
-        
-        $regionalDirectorApproval = $poApprovals->where('designation', 'Regional Director')->first();
-        $budgetOfficerApproval = $poApprovals->where('designation', 'Budget Officer')->first();
-    @endphp
+@php
+// CLEAN INITIALIZATION — prevents undefined variable
+
+$winningSupplier  = $supplier->business_name ?? 'Unknown Supplier';
+$supplierAddress  = $supplier->business_address ?? '';
+$supplierTin      = $supplier->tin ?? '';
+$supplierVat      = $supplier->vat ?? false;
+
+
+@endphp
+
+@php
+// Get parent and related procurements
+$parent = $procurement->parent;
+
+$rfq = $parent ? $parent->children()->where('module', 'request_for_quotation')->first() : null;
+$pr  = $parent ? $parent->children()->where('module', 'purchase_request')->first() : null;
+
+
+
+
+// Format TIN
+$tinDisplay = $supplierTin 
+    ? (($supplierVat ? 'VAT ' : 'NON-VAT ') . $supplierTin)
+    : '';
+
+// Delivery Term
+$deliveryTerm = 'Not set';
+if ($rfq) {
+    if ($rfq->delivery_mode === 'days' && $rfq->delivery_value) {
+        $deliveryTerm = "within {$rfq->delivery_value} calendar days upon receipt of Purchase Order";
+    } elseif ($rfq->delivery_mode === 'date' && $rfq->delivery_value) {
+        $deliveryTerm = \Carbon\Carbon::parse($rfq->delivery_value)->format('F j, Y');
+    }
+}
+
+// Procurement Type
+$procurementType = $procurement->procurement_type === 'small_value_procurement'
+    ? 'Small Value Procurement'
+    : 'Public Bidding';
+
+// PR Items
+$isLot = $pr && $pr->basis === 'lot';
+
+// Approvals
+$poApprovals = $procurement->approvals()
+    ->where('module', 'purchase_order')
+    ->orderBy('sequence')
+    ->with('employee.certificate')
+    ->get();
+
+$regionalDirectorApproval = $poApprovals->where('designation', 'Regional Director')->first();
+$budgetOfficerApproval    = $poApprovals->where('designation', 'Budget Officer')->first();
+@endphp
+
+
+
+@php
+// Use injected items (MAIL / VIEW CONTEXT)
+// Only compute fallback if NOT provided
+$totalContractAmount = 0;
+
+if (!isset($items)) {
+    $items = collect();
+}
+
+foreach ($items as $item) {
+    $totalContractAmount += $item->total_cost ?? 0;
+}
+@endphp
+
+
+
 
     <!-- Supplier & PO Details -->
     <table style="width:100%; border-collapse: collapse; font-size:11px;">
@@ -279,63 +326,45 @@
         </tr>
     </table>
 
-    <!-- Items Table -->
-    @php
-        $totalContractAmount = 0;
-        $itemsWithQuotes = [];
-        
-        if ($winnerRfqResponse && $items->isNotEmpty()) {
-            foreach ($items as $item) {
-                $quote = $winnerRfqResponse->quotes->firstWhere('procurement_item_id', $item->id);
-                $itemsWithQuotes[] = [
-                    'item' => $item,
-                    'unit_value' => $quote?->unit_value ?? 0,
-                    'total_value' => $quote?->total_value ?? 0,
-                ];
-                $totalContractAmount += $quote?->total_value ?? 0;
-            }
-        }
-    @endphp
 
-    <table class="items-table" style="width:100%; font-size:11px;">
-        <thead>
-            <tr>
-                <th style="width:8%;">{{ $isLot ? 'Lot No.' : 'Stock Property No.' }}</th>
-                <th style="width:10%;">Unit</th>
-                <th style="width:42%;">{{ $isLot ? 'Lot Description' : 'Item Description' }}</th>
-                <th style="width:10%;">Quantity</th>
-                <th style="width:15%;">Unit Cost</th>
-                <th style="width:15%;">Total Cost</th>
-            </tr>
-        </thead>
-        <tbody>
-            @foreach ($itemsWithQuotes as $data)
-                @php
-                    $item = $data['item'];
-                    $unitValue = $data['unit_value'];
-                    $totalValue = $data['total_value'];
-                @endphp
-                <tr>
-                    <td class="center">{{ $item->sort }}</td>
-                    <td class="center">{{ $item->unit }}</td>
-                    <td>{{ $item->item_description }}</td>
-                    <td class="center">{{ $item->quantity }}</td>
-                    <td class="right">&#8369;{{ number_format($unitValue, 2) }}</td>
-                    <td class="right">&#8369;{{ number_format($totalValue, 2) }}</td>
-                </tr>
-            @endforeach
-            @for ($i = count($itemsWithQuotes); $i < 5; $i++)
-                <tr>
-                    <td class="center"></td>
-                    <td class="center"></td>
-                    <td></td>
-                    <td class="center"></td>
-                    <td class="right"></td>
-                    <td class="right"></td>
-                </tr>
-            @endfor
-        </tbody>
-    </table>
+
+<table class="items-table" style="width:100%; font-size:11px;">
+    <thead>
+        <tr>
+            <th style="width:8%;">{{ $isLot ? 'Lot No.' : 'Stock Property No.' }}</th>
+            <th style="width:10%;">Unit</th>
+            <th style="width:42%;">{{ $isLot ? 'Lot Description' : 'Item Description' }}</th>
+            <th style="width:10%;">Quantity</th>
+            <th style="width:15%;">Unit Cost</th>
+            <th style="width:15%;">Total Cost</th>
+        </tr>
+    </thead>
+
+    <tbody>
+        @forelse ($items as $item)
+        <tr>
+            <td class="center">{{ $item->sort }}</td>
+            <td class="center">{{ $item->unit }}</td>
+            <td>{{ $item->item_description }}</td>
+            <td class="center">{{ $item->quantity }}</td>
+            <td class="right">&#8369;{{ number_format($item->unit_cost, 2) }}</td>
+            <td class="right">&#8369;{{ number_format($item->total_cost, 2) }}</td>
+        </tr>
+        @empty
+        <tr>
+            <td colspan="6" class="center">No awarded items</td>
+        </tr>
+        @endforelse
+
+        {{-- Pad rows to 5 (DomPDF safe) --}}
+        @for ($i = $items->count(); $i < 5; $i++)
+        <tr>
+            <td></td><td></td><td></td><td></td><td></td><td></td>
+        </tr>
+        @endfor
+    </tbody>
+</table>
+
 
     <!-- Purpose -->
     <table style="width:100%;">
@@ -374,113 +403,47 @@
         </tr>
     </table>
 
-    <!-- Signatories -->
-    <table style="width:100%; border-collapse: collapse; font-size:11px;">
-        <tr>
-            <td style="border-left:1px solid black; border-right:none; border-bottom:none; border-top:none; padding:30px 10px 5px 10px; text-align:center; width:50%; vertical-align:bottom;">
-                __________________________________<br>
-                <b>Signature over Printed Name of Supplier</b>
-            </td>
-            <td style="border-right:1px solid black; border-left:none; border-bottom:none; border-top:none; padding:10px; text-align:center; width:50%; vertical-align:bottom;">
-                @if($regionalDirectorApproval && $regionalDirectorApproval->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $regionalDirectorApproval->signature }}" 
-                             class="signature-img"
-                             alt="Signature">
-                    </div>
-                @else
-                    <div style="height:35px; margin-bottom:5px;"></div>
-                @endif
-                <span style="text-decoration:underline;"><b>{{ strtoupper($regionalDirectorApproval?->employee?->full_name ?? 'ENGR. REYNALDO T. SY') }}</b></span><br>
-                <i>Regional Director</i>
-            </td>
-        </tr>
-        <tr>
-            <td style="border-left:1px solid black; border-right:none; border-bottom:1px solid black; border-top:none; padding:30px 10px 5px 10px; text-align:center; vertical-align:bottom;">
-                __________________________________<br>
-                <b>Date</b>
-            </td>
-            <td style="border-right:1px solid black; border-left:none; border-bottom:1px solid black; border-top:none; padding:30px 10px 5px 10px;">
-                <!-- Empty cell -->
-            </td>
-        </tr>
-    </table>
 
-    <!-- Fund Cluster + Accountant Signature -->
-    <table style="width:100%; border-collapse: collapse; font-size:11px;">
-        <!-- Row 1: Fund Cluster + ORS/BURS No. -->
-        <tr>
-            <td style="border-left:1px solid black; border-top:1px solid black; border-bottom:none; border-right:none; padding:1px;">
-                <b>Fund Cluster:</b>
-            </td>
-            <td style="border-top:1px solid black; border-bottom:1px solid black; border-left:none; border-right:1px solid black; padding:1px; text-align:left;">
-                <span style="color:green; font-weight:bold;">{{ $procurement->fundCluster->name ?? 'Regular Agency Fund' }}</span>
-            </td>
-            <td style="border-top:1px solid black; border-bottom:none; border-left:none; border-right:none; padding:1px;">
-                <b>ORS/BURS No.:</b>
-            </td>
-            <td style="border-right:1px solid black; border-top:1px solid black; border-bottom:1px solid black; border-left:none; padding:1px; text-align:left; width:25%;">
-                <span style="color:purple; font-weight:bold;">{{ $procurement->ors_burs_no ?? 'Not set' }}</span>
-            </td>
-        </tr>
+<!-- SIGNATORIES -->
+<table style="width:100%; border-collapse: collapse; font-size:11px; margin-top:20px;">
+    <tr>
+        <td style="border-left:1px solid black; border-right:none; border-bottom:none; border-top:none; 
+                   padding:30px 10px 5px 10px; text-align:center; width:50%; vertical-align:bottom;">
+            __________________________________<br>
+            <b>Signature over Printed Name of Supplier</b>
+        </td>
 
-        <!-- Row 2: Funds Available + Date of ORS/BURS -->
-        <tr>
-            <td style="border-left:1px solid black; border-bottom:none; border-top:none; border-right:none; padding:1px;">
-                <b>Funds Available:</b>
-            </td>
-            <td style="border-bottom:1px solid black; border-top:none; border-left:none; border-right:1px solid black; padding:1px; text-align:left;">
-                <span style="color:green; font-weight:bold;">&#8369;{{ number_format($abc, 2) }}</span>
-            </td>
-            <td style="border-bottom:none; border-top:none; border-left:none; border-right:none; padding:1px;">
-                <b>Date of the ORS/BURS:</b>
-            </td>
-            <td style="border-right:1px solid black; border-bottom:1px solid black; border-top:none; border-left:none; padding:1px; text-align:left;">
-                <span style="color:purple; font-weight:bold;">
-                    {{ $procurement->ors_burs_date 
-                        ? \Carbon\Carbon::parse($procurement->ors_burs_date)->format('F j, Y') 
-                        : 'Not set' 
-                    }}
-                </span>
-            </td>
-        </tr>
+        <td style="border-right:1px solid black; border-left:none; border-bottom:none; border-top:none; 
+                   padding:10px; text-align:center; width:50%; vertical-align:bottom;">
+            {!! po_signatory_block($regionalDirector, 'Regional Director / HOPE') !!}
+        </td>
+    </tr>
 
-        <!-- Row 3: Amount -->
-        <tr>
-            <td style="border-left:1px solid black; border-bottom:none; border-top:none; border-right:none; padding:1px;"></td>
-            <td style="border-bottom:none; border-top:none; border-left:none; border-right:1px solid black; padding:1px;"></td>
-            <td style="border-bottom:none; border-top:none; border-left:none; border-right:none; padding:1px;">
-                <b>Amount:</b>
-            </td>
-            <td style="border-right:1px solid black; border-bottom:1px solid black; border-top:none; border-left:none; padding:1px; text-align:center;">
-                <span style="color:purple; font-weight:bold;">&#8369;{{ number_format($totalContractAmount, 2) }}</span>
-            </td>
-        </tr>
+    <tr>
+        <td style="border-left:1px solid black; border-right:none; border-bottom:1px solid black; border-top:none; 
+                   padding:30px 10px 5px 10px; text-align:center; vertical-align:bottom;">
+            __________________________________<br>
+            <b>Date</b>
+        </td>
 
-        <!-- Row 4: Accountant Signature -->
-        <tr>
-            <td colspan="2" style="border-left:1px solid black; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
-                    padding:10px; text-align:center; width:51.8%;">
-                @if($budgetOfficerApproval && $budgetOfficerApproval->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $budgetOfficerApproval->signature }}" 
-                             class="signature-img"
-                             alt="Signature">
-                    </div>
-                @else
-                    <div style="height:35px; margin-bottom:5px;"></div>
-                @endif
-                <div style="border-bottom:1px solid black; display:inline-block; padding-bottom:2px;">
-                    <b>{{ strtoupper($budgetOfficerApproval?->employee?->full_name ?? 'JANNETH G. CABINTA') }}</b>
-                </div><br>
-                <i>{{ $budgetOfficerApproval?->designation ?? 'Accountant III' }}</i>
-            </td>
-            <td colspan="2" style="border-left:none; border-right:1px solid black; border-bottom:1px solid black; border-top:none; 
-                    padding:30px 10px 5px 10px; width:48.2%;">
-                <!-- Empty cell -->
-            </td>
-        </tr>
-    </table>
+        <td style="border-right:1px solid black; border-left:none; border-bottom:1px solid black; border-top:none; padding:30px 10px 5px 10px;">
+        </td>
+    </tr>
+</table>
+
+<!-- FUND CERTIFICATION + ACCOUNTANT -->
+<table style="width:100%; border-collapse: collapse; font-size:11px;">
+    <tr>
+        <td colspan="2" style="border-left:1px solid black; border-right:1px solid black; border-bottom:1px solid black; 
+                border-top:none; padding:10px; text-align:center; width:51.8%;">
+            {!! po_signatory_block($accountant, 'Accountant') !!}
+        </td>
+
+        <td colspan="2" style="border-left:none; border-right:1px solid black; border-bottom:1px solid black; 
+                border-top:none; padding:30px 10px 5px 10px; width:48.2%;">
+        </td>
+    </tr>
+</table>
 
 </body>
 </html>

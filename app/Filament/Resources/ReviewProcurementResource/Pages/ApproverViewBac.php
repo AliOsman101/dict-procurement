@@ -17,6 +17,7 @@ use Carbon\Carbon;
 use App\Helpers\ActivityLogger;
 use Illuminate\Support\Facades\Mail;
 use App\Mail\BacStatusMail;
+use App\Mail\NextApproverNotificationMail;
 
 class ApproverViewBac extends ViewRecord
 {
@@ -214,110 +215,182 @@ class ApproverViewBac extends ViewRecord
         ];
 
         if ($canAct) {
-            $actions[] = Action::make('approve')
-                ->label('Approve')
-                ->icon('heroicon-o-check')
-                ->color('success')
-                ->requiresConfirmation()
-                ->action(function () use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Approved',
-                            'date_approved' => now(),
-                            'remarks' => null,
-                        ]);
+    /*
+    |--------------------------------------------------------------------------
+    | APPROVE BAC RESOLUTION
+    |--------------------------------------------------------------------------
+    */
+    $actions[] = Action::make('approve')
+        ->label('Approve')
+        ->icon('heroicon-o-check')
+        ->color('success')
+        ->requiresConfirmation()
+        ->action(function () use ($employeeId) {
 
-                        $allApproved = $this->record->approvals()
-                            ->where('module', 'bac_resolution_recommending_award')
-                            ->where('status', 'Pending')
-                            ->doesntExist();
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
 
-                        if ($allApproved) {
-                            $this->record->update(['status' => 'Approved']);
-                             $this->sendBacStatusEmail('Approved');
-                        }
+            if (!$approval) {
+                return;
+            }
 
-                        ActivityLogger::log(
-                            'Approved BAC Resolution',
-                            "BAC Resolution {$this->record->procurement_id} approved by " . Auth::user()->name
-                        );
+            // ✔ Update this approver's approval row
+            $approval->update([
+                'status' => 'Approved',
+                'date_approved' => now(),
+                'remarks' => null,
+            ]);
 
-                        Notification::make()->title('BAC Resolution approved')->success()->send();
-                        $this->record->refresh();
-                    }
-                });
+            // ✔ Check if all BAC approvers are done
+            $allApproved = !$this->record->bacApprovals()
+    ->where('status', 'Pending')
+    ->exists();
 
-            $actions[] = Action::make('reject')
-                ->label('Reject')
-                ->icon('heroicon-o-x-mark')
-                ->color('danger')
-                ->form([
-                    \Filament\Forms\Components\Textarea::make('remarks')
-                        ->label('Remarks')
-                        ->required()
-                        ->maxLength(255),
-                ])
-                ->action(function (array $data) use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+            if ($allApproved) {
+    // all approved
+    $this->record->update(['status' => 'Approved']);
+    $this->sendBacStatusEmail('Approved');
+} else {
+    // at least 1 approved
+    $this->sendBacStatusEmail('Approved');
+}
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Rejected',
-                            'date_approved' => now(),
-                            'remarks' => $data['remarks'],
-                        ]);
 
-                        $this->record->update(['status' => 'Rejected']);
-                        $this->record->parent->update(['status' => 'Rejected']);
+            // ✔ Log
+            ActivityLogger::log(
+                'Approved BAC Resolution',
+                "BAC Resolution {$this->record->procurement_id} approved by " . Auth::user()->name
+            );
 
-                        $this->sendBacStatusEmail('Rejected', $data['remarks']);
+            /*
+            |--------------------------------------------------------------------------
+            | NEXT APPROVER EMAIL NOTIFICATION (NEW)
+            |--------------------------------------------------------------------------
+            */
+            $nextApproval = $this->record->approvals()
+                ->where('module', 'bac_resolution_recommending_award')
+                ->where('sequence', '>', $approval->sequence)
+                ->where('status', 'Pending')
+                ->orderBy('sequence')
+                ->first();
 
-                        ActivityLogger::log(
-                            'Rejected BAC Resolution',
-                            "BAC Resolution {$this->record->procurement_id} rejected by " . Auth::user()->name . ": {$data['remarks']}"
-                        );
+            if ($nextApproval && $nextApproval->employee?->user?->email) {
+                try {
+                    \Mail::to($nextApproval->employee->user->email)
+                        ->send(new \App\Mail\NextApproverNotificationMail(
+                            $this->record,
+                            $nextApproval->employee->full_name,
+                            $nextApproval->sequence
+                        ));
+                } catch (\Exception $e) {
+                    \Log::error("FAILED TO SEND NEXT BAC APPROVER EMAIL: {$e->getMessage()}");
+                }
+            }
 
-                        Notification::make()->title('BAC Resolution rejected')->danger()->send();
-                        $this->record->refresh();
-                    }
-                });
-        }
+            // ✔ Notification
+            Notification::make()
+                ->title('BAC Resolution approved')
+                ->success()
+                ->send();
 
-        return $actions;
+            $this->record->refresh();
+        });
+
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | REJECT BAC RESOLUTION
+    |--------------------------------------------------------------------------
+    */
+    $actions[] = Action::make('reject')
+        ->label('Reject')
+        ->icon('heroicon-o-x-mark')
+        ->color('danger')
+        ->form([
+            \Filament\Forms\Components\Textarea::make('remarks')
+                ->label('Remarks')
+                ->required()
+                ->maxLength(255),
+        ])
+        ->action(function (array $data) use ($employeeId) {
+
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
+
+            if (!$approval) {
+                return;
+            }
+
+            // ✔ Update approval row
+            $approval->update([
+                'status' => 'Rejected',
+                'date_approved' => now(),
+                'remarks' => $data['remarks'],
+            ]);
+
+            // ✔ Reject the module AND its parent
+            $this->record->update(['status' => 'Rejected']);
+            $this->record->parent()->update(['status' => 'Rejected']);
+
+            // ✔ Email notification (existing)
+            $this->sendBacStatusEmail('Rejected', $data['remarks']);
+
+            // ✔ Log
+            ActivityLogger::log(
+                'Rejected BAC Resolution',
+                "BAC Resolution {$this->record->procurement_id} rejected by " . Auth::user()->name .
+                ": {$data['remarks']}"
+            );
+
+            // ✔ Alert
+            Notification::make()
+                ->title('BAC Resolution rejected')
+                ->danger()
+                ->send();
+
+            $this->record->refresh();
+        });
+}
+
+return $actions;
+
     }
     private function sendBacStatusEmail(string $status, ?string $remarks = null): void
 {
-    $procurement = $this->record;
+    $procurement = $this->record; // BAC child
     $approver = auth()->user();
 
-    // Employees assigned to the procurement
-    $employees = $procurement->employees ?? collect();
+    // Get PR (root)
+    $pr = $procurement->parent;
 
-    // Creator of the PR
-    $creator = $procurement->parent?->requester ?? null;
-
-    // Send to all assigned employees
-    foreach ($employees as $employee) {
-        if ($employee->email) {
-            \Mail::to($employee->email)->send(
-                new \App\Mail\BacStatusMail($procurement, $approver, $status, $remarks)
-            );
-        }
+    if (! $pr) {
+        return;
     }
 
-    // Send to the requester/creator
+    // RECIPIENT 1: PR creator (MOST IMPORTANT)
+    $creator = $pr->creator ?? $pr->requester ?? null;
+
     if ($creator && $creator->email) {
-        \Mail::to($creator->email)->send(
-            new \App\Mail\BacStatusMail($procurement, $approver, $status, $remarks)
+        Mail::to($creator->email)->send(
+            new BacStatusMail($procurement, $approver, $status, $remarks)
         );
+    }
+
+    // RECIPIENT 2: Employees assigned in PR
+    $prEmployees = $pr->employees ?? collect();
+
+    foreach ($prEmployees as $employee) {
+        if ($employee->email) {
+            Mail::to($employee->email)->send(
+                new BacStatusMail($procurement, $approver, $status, $remarks)
+            );
+        }
     }
 }
 }

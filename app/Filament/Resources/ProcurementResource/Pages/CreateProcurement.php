@@ -68,6 +68,7 @@ protected function afterCreate(): void
         'purchase_request' => 'PR',
         'request_for_quotation' => 'RFQ',
         'abstract_of_quotation' => 'AOQ',
+        'minutes_of_opening' => 'MO',
         'bac_resolution_recommending_award' => 'BAC',
         'purchase_order' => 'PO',
     ];

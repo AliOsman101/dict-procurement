@@ -15,11 +15,13 @@ class RfqMail extends Mailable
 
     public $emailBody;
     public $pdfPath;
+    public $rfqDistributionId;
 
-    public function __construct($emailBody, $pdfPath)
+    public function __construct($emailBody, $pdfPath, $rfqDistributionId = null)
     {
-        $this->emailBody = $emailBody; // Already processed in the action
+        $this->emailBody = $emailBody;
         $this->pdfPath = $pdfPath;
+        $this->rfqDistributionId = $rfqDistributionId;
     }
 
     public function envelope(): Envelope
@@ -32,10 +34,14 @@ class RfqMail extends Mailable
 
     public function content(): Content
     {
+        // Build receipt URL if id present
+        $receiveUrl = $this->rfqDistributionId ? route('rfq.receive', $this->rfqDistributionId) : null;
+
         return new Content(
             view: 'emails.rfq',
             with: [
                 'emailBody' => $this->emailBody,
+                'receiveUrl' => $receiveUrl,
             ],
         );
     }

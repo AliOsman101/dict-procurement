@@ -96,6 +96,7 @@ class DefaultApprover extends Model
             'purchase_request',
             'request_for_quotation',
             'abstract_of_quotation',
+            'minutes_of_opening',
             'bac_resolution_recommending_award',
             'purchase_order'
         ];

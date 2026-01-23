@@ -54,4 +54,29 @@ class AoqEvaluation extends Model
     {
         return str_starts_with($this->requirement, 'quote_');
     }
+    public function getRequirementIdAttribute(): ?int
+{
+    if (!$this->requirement) {
+        return null;
+    }
+
+    if (!str_starts_with($this->requirement, 'quote_')) {
+        return null;
+    }
+
+    return (int) str_replace('quote_', '', $this->requirement);
+}
+public function winningQuote(): ?\App\Models\Quote
+{
+    if (! $this->rfqResponse) {
+        return null;
+    }
+
+    return $this->rfqResponse
+        ->quotes()
+        ->where('procurement_item_id', $this->requirement_id)
+        ->first();
+}
+
+
 }

@@ -11,7 +11,7 @@ class Quote extends Model
         'rfq_response_id',
         'procurement_item_id',
         'statement_of_compliance',
-        'specifications', // New combined field
+        'specifications',
         'unit_value',
         'total_value',
     ];
@@ -21,6 +21,17 @@ class Quote extends Model
         'unit_value' => 'decimal:2',
         'total_value' => 'decimal:2',
     ];
+
+    protected static function booted()
+    {
+        // Auto-calculate total_value before saving
+        static::saving(function ($quote) {
+            if ($quote->unit_value && $quote->procurementItem) {
+                $quantity = $quote->procurementItem->quantity ?? 0;
+                $quote->total_value = $quote->unit_value * $quantity;
+            }
+        });
+    }
 
     public function rfqResponse(): BelongsTo
     {

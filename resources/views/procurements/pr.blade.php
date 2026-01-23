@@ -214,8 +214,13 @@
         ->orderBy('sequence')
         ->get();
 
-    $approvedByApproval    = $prApprovals->where('designation', 'Regional Director')->first();
-    $budgetOfficerApproval = $prApprovals->where('designation', 'Budget Officer')->first();
+// use approvers passed from controller 
+$firstApprover = $firstApprover ?? null;
+$secondApprover = $secondApprover ?? null;
+
+
+
+
     $requestedByApproval = $procurement->requester ? (object) [
         'employee' => $procurement->requester,
         'signature' => $prApprovals->where('employee_id', $procurement->requested_by)->first()?->signature
@@ -253,41 +258,13 @@
         </td>
         
         <!-- Approved By -->
-        <td style="width:50%; padding:6px; vertical-align:top; border-left:none;">
-            <span class="italic-label">Approved By:</span>
-            
-            @if($approvedByApproval && $approvedByApproval->signature)
-                <div class="signature-container">
-                    <img src="data:image/png;base64,{{ $approvedByApproval->signature }}" 
-                         class="signature-img"
-                         alt="Signature">
-                </div>
-            @else
-                <div style="height:30px;"></div>
-            @endif
-            
-            <!-- Name -->
-            <div style="text-align:center; margin-top:2px;">
-                <div style="border-bottom:1px solid black; display:inline-block; min-width:280px; padding:2px 5px;">
-                    <strong>{{ $approvedByApproval?->employee?->full_name ?? 'Not set' }}</strong>
-                </div>
-            </div>
-            
-            <!-- Designation -->
-            <div style="margin-top:3px; text-align:center; font-style:italic;">
-                Regional Director
-            </div>
-        </td>
-    </tr>
-</table>
-
-<!-- Funds Available -->
-<div style="margin-top:40px; text-align:center;">
-    <div class="purple" style="margin-bottom:5px;">FUNDS AVAILABLE</div>
+        <!-- Approved By (1st Approver - Budget Officer) -->
+<td style="width:50%; padding:6px; vertical-align:top; border-left:none;">
+    <span class="italic-label">Approved By:</span>
     
-    @if($budgetOfficerApproval && $budgetOfficerApproval->signature)
+    @if($firstApprover && $firstApprover->signature)
         <div class="signature-container">
-            <img src="data:image/png;base64,{{ $budgetOfficerApproval->signature }}" 
+            <img src="data:image/png;base64,{{ $firstApprover->signature }}" 
                  class="signature-img"
                  alt="Signature">
         </div>
@@ -296,13 +273,47 @@
     @endif
     
     <!-- Name -->
-    <div style="margin-top:2px;">
-        <strong>{{ $budgetOfficerApproval?->employee?->full_name ?? 'Not set' }}</strong>
+    <div style="text-align:center; margin-top:2px;">
+        <div style="border-bottom:1px solid black; display:inline-block; min-width:280px; padding:2px 5px;">
+            <strong>{{ $firstApprover?->employee?->full_name ?? 'Not set' }}</strong>
+        </div>
     </div>
     
     <!-- Designation -->
+    <div style="margin-top:3px; text-align:center; font-style:italic;">
+    {{ $firstApprover->designation ?? 'Designation not set' }}
+</div>
+
+</td>
+
+
+    </tr>
+</table>
+
+<!-- Funds Available -->
+<div style="margin-top:40px; text-align:center;">
+    <div class="purple" style="margin-bottom:5px;">FUNDS AVAILABLE</div>
+    
+    @if($secondApprover && $secondApprover->signature)
+    <div class="signature-container">
+        <img src="data:image/png;base64,{{ $secondApprover->signature }}" 
+             class="signature-img"
+             alt="Signature">
+    </div>
+@else
+    <div style="height:30px;"></div>
+@endif
+
+    
+    <!-- Name -->
     <div style="margin-top:2px;">
-        <i>Budget Officer</i>
+        <strong>{{ $secondApprover?->employee?->full_name ?? 'Not set' }}</strong>
+    </div>
+    
+    <div style="margin-top:2px;">
+    <i>{{ $secondApprover->designation ?? 'Designation not set' }}</i>
+</div>
+
     </div>
 </div>
 

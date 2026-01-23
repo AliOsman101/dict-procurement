@@ -185,106 +185,111 @@
         {{ $day }}<sup>{{ $suffix }}</sup> day of {{ $month }} {{ $year }}.
     </div>
 
-    <!-- Signatories -->
-    @php
-        // Get BAC Resolution Approvals with Signatures
-        $bacApprovals = $procurement->approvals()
-            ->where('module', 'bac_resolution_recommending_award')
-            ->orderBy('sequence')
-            ->with('employee.certificate')
-            ->get();
+  @php
+use App\Models\DefaultApprover;
+use Illuminate\Support\Facades\Crypt;
 
-        // Get unique Regular Members (max 2), avoiding duplicates by employee_id
-        $regularMembers = $bacApprovals->whereIn('designation', ['Regular Member', 'Regular Member (Principal)'])
-            ->unique('employee_id')
-            ->values()
-            ->take(2);
+/*
+ |-------------------------------------------------------
+ | Fetch Default Approver for BAC Resolution Module
+ |-------------------------------------------------------
+*/
+function getBacResoDefault($seq) {
+    return DefaultApprover::where('module', 'bac_resolution_recommending_award')
+        ->where('sequence', $seq)
+        ->with('employee.certificate')
+        ->first();
+}
 
-        // Assign other roles based on designation
-        $provisionalMember = $bacApprovals->whereIn('designation', ['Provisional Member', 'Provisional Member / End-User'])->first();
-        $viceChairperson = $bacApprovals->where('designation', 'Vice - Chairperson')->first();
-        $chairperson = $bacApprovals->where('designation', 'Chairperson')->first();
-    @endphp
-    <table class="no-border" style="width:100%; text-align:center; margin-top: 30px; border:none;">
-        <tr>
-            @foreach($regularMembers as $member)
-                <td colspan="2" style="width:33.33%; text-align:center; border:none; padding: 10px 5px 5px 5px;">
-                    @if($member->signature)
-                        <div class="signature-container">
-                            <img src="data:image/png;base64,{{ $member->signature }}" 
-                                 class="signature-img"
-                                 alt="Signature">
-                        </div>
-                    @else
-                        <div style="height:30px; margin-bottom:5px;"></div>
-                    @endif
-                    <div class="signatory-name" style="border-bottom:1px solid black; width:80%; margin:0 auto;">
-                        <span style="font-weight:bold; text-transform:uppercase;">{{ $member->employee->full_name ?? '' }}</span>
-                    </div>
-                    <i>Regular Member (Principal)</i>
-                </td>
-            @endforeach
-            <td colspan="2" style="width:33.33%; text-align:center; border:none; padding: 10px 5px 5px 5px;">
-                @if($provisionalMember && $provisionalMember->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $provisionalMember->signature }}" 
-                             class="signature-img"
-                             alt="Signature">
-                    </div>
-                @else
-                    <div style="height:30px; margin-bottom:5px;"></div>
-                @endif
-                <div class="signatory-name" style="border-bottom:1px solid black; width:80%; margin:0 auto;">
-                    <span style="font-weight:bold; text-transform:uppercase;">{{ $provisionalMember?->employee?->full_name ?? '' }}</span>
-                </div>
-                <i>Provisional Member / End-User</i>
-            </td>
-        </tr>
-        <tr>
-            <td style="width:16.67%; border:none;"></td>
-            <td colspan="2" style="width:33.33%; text-align:center; border:none; padding: 30px 5px 5px 5px;">
-                @if($viceChairperson && $viceChairperson->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $viceChairperson->signature }}" 
-                             class="signature-img"
-                             alt="Signature">
-                    </div>
-                @else
-                    <div style="height:30px; margin-bottom:5px;"></div>
-                @endif
-                <div class="signatory-name" style="border-bottom:1px solid black; width:60%; margin:0 auto;">
-                    <span style="font-weight:bold; text-transform:uppercase;">{{ $viceChairperson?->employee?->full_name ?? '' }}</span>
-                </div>
-                <i>Vice - Chairperson</i>
-            </td>
-            <td colspan="2" style="width:33.33%; text-align:center; border:none; padding: 30px 5px 5px 5px;">
-                @if($chairperson && $chairperson->signature)
-                    <div class="signature-container">
-                        <img src="data:image/png;base64,{{ $chairperson->signature }}" 
-                             class="signature-img"
-                             alt="Signature">
-                    </div>
-                @else
-                    <div style="height:30px; margin-bottom:5px;"></div>
-                @endif
-                <div class="signatory-name" style="border-bottom:1px solid black; width:60%; margin:0 auto;">
-                    <span style="font-weight:bold; text-transform:uppercase;">{{ $chairperson?->employee?->full_name ?? '' }}</span>
-                </div>
-                <i>Chairperson</i>
-            </td>
-            <td style="width:16.67%; border:none;"></td>
-        </tr>
-    </table>
+$chair       = getBacResoDefault(5);
+$vice        = getBacResoDefault(4);
+$member1     = getBacResoDefault(1);
+$member2     = getBacResoDefault(2);
+$provisional = getBacResoDefault(3);
+$hope        = getBacResoDefault(6);   // <- HOPE (Approved By)
 
-    <!-- Approved By -->
-    <div class="approved-by">
-        Approved By:
-    </div>
-    <div style="text-align:left; margin-top:40px; margin-left:30px;">
-        <b>ENGR. REYNALDO T. SY</b><br>
-        Regional Director<br>
-        Head of Procuring Entity (HOPE)
-    </div>
+/*
+ |-------------------------------------------------------
+ | Build signatory block
+ |-------------------------------------------------------
+*/
+function bac_reso_signatory($approver, $fallbackLabel) {
+
+    if (!$approver) {
+        return '
+            <div class="signature-container"></div>
+            <span class="underline">________________</span><br>
+            <i>'.$fallbackLabel.'</i>
+        ';
+    }
+
+    $employee = $approver->employee;
+    $name = strtoupper($employee->full_name ?? 'NOT SET');
+    $designation = $approver->designation ?? $fallbackLabel;
+
+    // decrypt signature if exists
+    $signature = null;
+    if ($employee?->certificate?->signature_image_path) {
+        try {
+            $signature = Crypt::decryptString($employee->certificate->signature_image_path);
+        } catch (\Exception $e) {
+            $signature = null;
+        }
+    }
+
+    return '
+        '.($signature ? 
+            '<div class="signature-container">
+                <img class="signature-img" src="data:image/png;base64,'.$signature.'">
+            </div>'
+            :
+            '<div class="signature-container"></div>'
+        ).'
+        <span class="underline">'.$name.'</span><br>
+        <i>'.$designation.'</i>
+    ';
+}
+@endphp
+
+<!-- BAC RESO SIGNATORIES -->
+<table class="no-border" style="width:100%; text-align:center; margin-top: 40px;">
+    <tr>
+        <td style="border:none;">
+            {!! bac_reso_signatory($member1, 'Regular Member') !!}
+        </td>
+
+        <td style="border:none;">
+            {!! bac_reso_signatory($member2, 'Regular Member') !!}
+        </td>
+
+        <td style="border:none;">
+            {!! bac_reso_signatory($provisional, 'Provisional Member / End-User') !!}
+        </td>
+    </tr>
+
+    <tr>
+        <td style="border:none;"></td>
+
+        <td style="border:none;">
+            {!! bac_reso_signatory($vice, 'BAC Vice-Chairperson') !!}
+        </td>
+
+        <td style="border:none;">
+            {!! bac_reso_signatory($chair, 'BAC Chairperson') !!}
+        </td>
+
+        <td style="border:none;"></td>
+    </tr>
+</table>
+
+<!-- APPROVED BY -->
+<div class="approved-by">Approved By:</div>
+
+<div style="text-align:left; margin-top:40px; margin-left:30px;">
+    {!! bac_reso_signatory($hope, 'Head of Procuring Entity (HOPE)') !!}
+</div>
+
+
 
 </body>
 </html>

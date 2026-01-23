@@ -7,7 +7,6 @@ use App\Models\ActivityLog;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Filament\Tables\Actions\Action;
 
 class HistoryLogResource extends Resource
 {
@@ -24,35 +23,91 @@ class HistoryLogResource extends Resource
                     ->label('User')
                     ->sortable()
                     ->searchable(),
-            
+
                 Tables\Columns\TextColumn::make('action')
                     ->searchable(),
+
                 Tables\Columns\TextColumn::make('details')
                     ->limit(50)
                     ->wrap(),
+
                 Tables\Columns\TextColumn::make('ip_address')
                     ->label('IP Address')
                     ->toggleable(isToggledHiddenByDefault: true),
+
                 Tables\Columns\TextColumn::make('created_at')
                     ->dateTime('M d, Y h:i A')
                     ->sortable(),
             ])
             ->defaultSort('created_at', 'desc')
 
-            // 🧹 Add the Clear Logs button here
-            ->headerActions([
-                Action::make('clearLogs')
-                    ->label('Clear All Logs')
-                    ->color('danger')
-                    ->requiresConfirmation()
-                    ->icon('heroicon-o-trash')
-                    ->action(function () {
-                        ActivityLog::truncate();
-                    })
-                    ->successNotificationTitle('All history logs have been cleared successfully.'),
+            ->headerActions([]) // Removed Clear Logs
+
+            ->filters([
+
+                // LOGIN / LOGOUT (only works if you implement login logs)
+                Tables\Filters\SelectFilter::make('auth_filter')
+                    ->label('Login / Logout')
+                    ->options([
+                        'Login' => 'Login',
+                        'Logout' => 'Logout',
+                    ])
+                    ->query(function ($query, array $data) {
+                        if (! $data['value']) return $query;
+                        return $query->where('action', $data['value']);
+                    }),
+
+                // PURCHASE REQUEST FILTER
+                Tables\Filters\SelectFilter::make('pr_filter')
+                    ->label('Purchase Request Actions')
+                    ->options([
+                        'Locked Purchase Request'   => 'Locked Purchase Request',
+                        'Approved Purchase Request' => 'Approved Purchase Request',
+                        'Rejected Purchase Request' => 'Rejected Purchase Request',
+                    ])
+                    ->query(fn ($query, array $data) =>
+                        $data['value'] ? $query->where('action', $data['value']) : $query
+                    ),
+
+                // RFQ FILTER
+                Tables\Filters\SelectFilter::make('rfq_filter')
+                    ->label('Request for Quotation Actions')
+                    ->options([
+                        'Locked Request for Quotation' => 'Locked Request for Quotation',
+                        'Distributed RFQ'              => 'Distributed RFQ',
+                        'Approved Request for Quotation' => 'Approved Request for Quotation',
+                        'Rejected Request for Quotation' => 'Rejected Request for Quotation',
+                    ])
+                    ->query(fn ($query, array $data) =>
+                        $data['value'] ? $query->where('action', $data['value']) : $query
+                    ),
+
+                // AOQ FILTER
+                Tables\Filters\SelectFilter::make('aoq_filter')
+                    ->label('Abstract of Quotation Actions')
+                    ->options([
+                        'Supplier Response Created'    => 'Supplier Response Created',
+                        'Approved Abstract of Quotation' => 'Approved Abstract of Quotation',
+                        'Rejected Abstract of Quotation' => 'Rejected Abstract of Quotation',
+                    ])
+                    ->query(fn ($query, array $data) =>
+                        $data['value'] ? $query->where('action', $data['value']) : $query
+                    ),
+
+                // PURCHASE ORDER FILTER
+                Tables\Filters\SelectFilter::make('po_filter')
+                    ->label('Purchase Order Actions')
+                    ->options([
+                        'Locked Purchase Order'    => 'Locked Purchase Order',
+                        'Set PO Details'           => 'Set PO Details',
+                        'Approved Purchase Order'  => 'Approved Purchase Order',
+                        'Rejected Purchase Order'  => 'Rejected Purchase Order',
+                    ])
+                    ->query(fn ($query, array $data) =>
+                        $data['value'] ? $query->where('action', $data['value']) : $query
+                    ),
             ])
 
-            ->filters([])
             ->actions([])
             ->bulkActions([]);
     }

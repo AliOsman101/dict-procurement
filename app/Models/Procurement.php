@@ -64,17 +64,23 @@ class Procurement extends Model
             }
         });
 
-        // Remove custom attributes before saving
         static::saving(function ($model) {
-            // Remove custom collections that don't exist in database
             unset($model->attributes['rfqResponses']);
             unset($model->attributes['procurementItems']);
             unset($model->attributes['requester']);
         });
 
         static::deleting(function ($model) {
-            // Delete all child procurements
             $model->children()->delete();
+        });
+
+        /**
+         * 🔥 Automatically generate approvers when a Purchase Request is created
+         */
+        static::created(function ($model) {
+            if ($model->module === 'purchase_request') {
+                $model->generateApprovalsForPR();
+            }
         });
     }
 
@@ -169,24 +175,44 @@ class Procurement extends Model
         return $this->requester?->firstname . ' ' . $this->requester?->lastname ?? 'Not set';
     }
 
-    /** 
-     * Relationship to the RFQ (Request for Quotation) child procurement
-     */
     public function rfq()
     {
         return $this->hasOne(Procurement::class, 'parent_id')
             ->where('module', 'request_for_quotation');
     }
 
-    /** delivery_mode – fall back to RFQ if empty */
     public function getDeliveryModeAttribute($value)
     {
         return $value ?? $this->rfq?->delivery_mode;
     }
 
-    /** delivery_value – fall back to RFQ if empty */
     public function getDeliveryValueAttribute($value)
     {
         return $value ?? $this->rfq?->delivery_value;
+    }
+
+    public function bacApprovals()
+    {
+        return $this->approvals()->where('module', 'bac_resolution_recommending_award');
+    }
+
+    /**
+     * ✅ Generate Approval Rows for Purchase Request
+     * Copies Default Approvers → approvals table
+     */
+    public function generateApprovalsForPR()
+    {
+        $defaults = \App\Models\DefaultApprover::where('module', 'purchase_request')
+            ->orderBy('sequence')
+            ->get();
+
+        foreach ($defaults as $default) {
+            $this->approvals()->create([
+                'module' => 'purchase_request',
+                'employee_id' => $default->employee_id,
+                'designation' => $default->designation,
+                'sequence' => $default->sequence,
+            ]);
+        }
     }
 }

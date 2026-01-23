@@ -22,6 +22,8 @@ use Illuminate\Support\Facades\Mail;
 use App\Mail\WinningSupplierMail;
 use App\Mail\LosingSupplierMail;
 use App\Models\Supplier;
+use App\Mail\NextApproverNotificationMail;
+
 
 class ApproverViewAoq extends ViewRecord
 {
@@ -283,32 +285,42 @@ class ApproverViewAoq extends ViewRecord
                             ->label('')
                             ->getStateUsing(function ($record) {
                                 if (is_null($record->bid_opening_datetime)) {
-                                    return 'Bid opening date and time has not been set yet.';
+                                    return 'Please set the Date and Time of Bid Opening to evaluate suppliers.';
                                 }
                                 if (Carbon::now()->lessThan($record->bid_opening_datetime)) {
                                     return 'Evaluations can start on ' . $record->bid_opening_datetime->format('Y-m-d h:i A') . '.';
                                 }
+                                
+                                // Show "No RFQ responses" if no responses exist after bid opening
+                                if ($record->rfqResponses->isEmpty()) {
+                                    return 'No RFQ responses documented yet.';
+                                }
+                                
                                 return null;
                             })
-                            ->hidden(function ($record) {
-                                return !is_null($record->bid_opening_datetime) && 
-                                    Carbon::now()->greaterThanOrEqualTo($record->bid_opening_datetime);
+                            ->visible(function ($record) {
+                                return is_null($record->bid_opening_datetime) || 
+                                    Carbon::now()->lessThan($record->bid_opening_datetime) ||
+                                    ($record->rfqResponses->isEmpty() && Carbon::now()->greaterThanOrEqualTo($record->bid_opening_datetime));
                             })
                             ->formatStateUsing(fn ($state) => $state)
-                            ->extraAttributes(['class' => 'text-red-600 font-semibold']),
+                            ->extraAttributes(['class' => 'text-red-600 dark:text-red-400 font-semibold text-center']),
+
                         TextEntry::make('supplier_list')
                             ->label('')
                             ->html()
                             ->getStateUsing(function ($record) use ($isLot, $numberLabel, $descriptionLabel) {
+                                if (is_null($record->bid_opening_datetime) || 
+                                    Carbon::now()->lessThan($record->bid_opening_datetime) ||
+                                    $record->rfqResponses->isEmpty()) {
+                                    return '';
+                                }
+
                                 $record->load([
                                     'rfqResponses.aoqEvaluations' => function ($query) use ($record) {
                                         $query->where('procurement_id', $record->id);
                                     }
                                 ]);
-
-                                if ($record->rfqResponses->isEmpty()) {
-                                    return '<p class="text-gray-500">No RFQ responses received yet</p>';
-                                }
 
                                 $html = '';
                                 $hasAnyEvaluations = AoqEvaluation::where('procurement_id', $record->id)->exists();
@@ -328,6 +340,111 @@ class ApproverViewAoq extends ViewRecord
                                 
                                 $evaluationComplete = $totalDocs > 0 && $evaluatedDocs >= $totalDocs;
 
+                                // Get PR basis
+                                $pr = Procurement::where('parent_id', $record->parent_id)
+                                    ->where('module', 'purchase_request')
+                                    ->first();
+                                $basis = $pr?->basis ?? 'item';
+
+                                // Show per-item comparison table if basis is 'item'
+                                if ($basis === 'item' && $evaluationComplete) {
+                                    $html .= '<div class="w-full mb-6">';
+                                    $html .= '<h3 class="text-xl font-bold mb-4">Quote Comparison by Item</h3>';
+                                    $html .= '<div class="w-full overflow-x-auto">';
+                                    $html .= '<table class="min-w-full w-full divide-y divide-gray-200 dark:divide-gray-700">';
+                                    $html .= '<thead class="bg-gray-50 dark:bg-gray-700">';
+                                    $html .= '<tr>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">' . $numberLabel . '</th>';
+                                    $html .= '<th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">' . $descriptionLabel . '</th>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">Qty</th>';
+                                    $html .= '<th class="px-3 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">Unit</th>';
+                                    $html .= '<th class="px-3 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">ABC Unit</th>';
+
+                                    // Add column for each supplier
+                                    foreach ($record->rfqResponses as $rfqResponse) {
+                                        $supplierName = $rfqResponse->supplier?->business_name ?? 'Unknown';
+                                        $html .= '<th class="px-3 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap">' . e($supplierName) . '</th>';
+                                    }
+                                    $html .= '</tr>';
+                                    $html .= '</thead>';
+                                    $html .= '<tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">';
+
+                                    // Loop through each item
+                                    foreach ($record->procurementItems as $item) {
+                                        $html .= '<tr>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top">' . e($item->sort) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm align-top">' . e($item->item_description) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top whitespace-nowrap">' . e($item->quantity) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-center align-top whitespace-nowrap">' . e($item->unit) . '</td>';
+                                        $html .= '<td class="px-3 py-3 text-sm text-right align-top whitespace-nowrap">₱' . number_format($item->unit_cost, 2) . '</td>';
+
+                                        // Show each supplier's quote for this item
+                                        foreach ($record->rfqResponses as $rfqResponse) {
+                                            $quote = $rfqResponse->quotes->firstWhere('procurement_item_id', $item->id);
+                                            
+                                            // Check if this supplier is disqualified
+                                            $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                                                ->where('rfq_response_id', $rfqResponse->id)
+                                                ->where('requirement', 'not like', 'quote_%')
+                                                ->where('status', 'fail')
+                                                ->exists();
+
+                                            // Check if this is the winning bid for this item
+                                            $isWinner = false;
+                                            if (!$disqualified && $quote) {
+                                                $evaluation = AoqEvaluation::where('procurement_id', $record->id)
+                                                    ->where('rfq_response_id', $rfqResponse->id)
+                                                    ->where('requirement', 'quote_' . $item->id)
+                                                    ->where('lowest_bid', true)
+                                                    ->exists();
+                                                $isWinner = $evaluation;
+                                            }
+
+                                            if ($quote && !$disqualified) {
+                                                $bgClass = $isWinner ? 'bg-green-100 dark:bg-green-900/30' : '';
+                                                $html .= '<td class="px-3 py-3 text-sm text-right align-top font-semibold whitespace-nowrap ' . $bgClass . '">';
+                                                $html .= '₱' . number_format($quote->unit_value, 2);
+                                                if ($isWinner) {
+                                                    $html .= ' <span class="ml-1 text-green-600 dark:text-green-400 text-lg">🏆</span>';
+                                                }
+                                                $html .= '</td>';
+                                            } elseif ($disqualified) {
+                                                $html .= '<td class="px-3 py-3 text-sm text-center align-top text-red-500 whitespace-nowrap">❌</td>';
+                                            } else {
+                                                $html .= '<td class="px-3 py-3 text-sm text-center align-top text-gray-400">—</td>';
+                                            }
+                                        }
+                                        $html .= '</tr>';
+                                    }
+
+                                    // Add total row
+                                    $html .= '<tr class="bg-gray-50 dark:bg-gray-700 font-bold">';
+                                    $html .= '<td colspan="4" class="px-3 py-3 text-sm text-right">Grand Total:</td>';
+                                    $html .= '<td class="px-3 py-3 text-sm text-right whitespace-nowrap">₱' . number_format($record->procurementItems->sum('total_cost'), 2) . '</td>';
+                                    
+                                    foreach ($record->rfqResponses as $rfqResponse) {
+                                        $disqualified = AoqEvaluation::where('procurement_id', $record->id)
+                                            ->where('rfq_response_id', $rfqResponse->id)
+                                            ->where('requirement', 'not like', 'quote_%')
+                                            ->where('status', 'fail')
+                                            ->exists();
+
+                                        if (!$disqualified) {
+                                            $totalQuoted = $rfqResponse->quotes->sum('total_value');
+                                            $html .= '<td class="px-3 py-3 text-sm text-right whitespace-nowrap">₱' . number_format($totalQuoted, 2) . '</td>';
+                                        } else {
+                                            $html .= '<td class="px-3 py-3 text-sm text-center text-red-500">—</td>';
+                                        }
+                                    }
+                                    $html .= '</tr>';
+
+                                    $html .= '</tbody>';
+                                    $html .= '</table>';
+                                    $html .= '</div>'; // close overflow-x-auto
+                                    $html .= '</div>'; // close w-full mb-6
+                                }
+
+                                // Original display for document evaluation and individual supplier details
                                 foreach ($record->rfqResponses as $rfqResponse) {
                                     $supplierName = $rfqResponse->supplier?->business_name ?? $rfqResponse->business_name ?? 'Unknown Supplier';
 
@@ -355,13 +472,22 @@ class ApproverViewAoq extends ViewRecord
                                     if ($hasFailedDocs) {
                                         $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-red-100 text-red-800 dark:bg-red-800 dark:text-red-100">❌ DISQUALIFIED</span>';
                                     } elseif ($hasWinningBids) {
-                                        $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID</span>';
+                                        if ($basis === 'item') {
+                                            $winningItemsCount = AoqEvaluation::where('procurement_id', $record->id)
+                                                ->where('rfq_response_id', $rfqResponse->id)
+                                                ->where('lowest_bid', true)
+                                                ->count();
+                                            $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID (' . $winningItemsCount . ' items)</span>';
+                                        } else {
+                                            $html .= '<span class="px-3 py-1 text-sm font-semibold rounded-full bg-green-100 text-green-800 dark:bg-green-800 dark:text-green-100">🏆 WINNING BID</span>';
+                                        }
                                     }
 
                                     $html .= '</div>';
 
+                                    // Document Evaluation Section (collapsed by default)
                                     $html .= '<div class="mb-6">';
-                                    $html .= '<details class="border rounded-lg" open>';
+                                    $html .= '<details class="border rounded-lg">';
                                     $html .= '<summary class="cursor-pointer p-4 font-semibold bg-gray-50 dark:bg-gray-700">Document Evaluation</summary>';
                                     $html .= '<div class="p-4">';
                                     
@@ -450,54 +576,6 @@ class ApproverViewAoq extends ViewRecord
 
                                     $html .= '</div></details></div>';
 
-                                    $html .= '<div class="mb-6">';
-                                    $html .= '<details class="border rounded-lg" open>';
-                                    $html .= '<summary class="cursor-pointer p-4 font-semibold bg-gray-50 dark:bg-gray-700">Quote Comparison</summary>';
-                                    $html .= '<div class="p-4">';
-
-                                    if ($rfqResponse->quotes->count() > 0) {
-                                        $html .= '<div class="overflow-x-auto"><table class="w-full divide-y divide-gray-200 dark:divide-gray-700" style="table-layout: fixed;">';
-                                        $html .= '<thead class="bg-gray-50 dark:bg-gray-700"><tr>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 6%;">' . $numberLabel . '</th>';
-                                        $html .= '<th class="px-2 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 22%;">' . $descriptionLabel . '</th>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 6%;">Qty</th>';
-                                        $html .= '<th class="px-2 py-2 text-center text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 8%;">Unit</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 13%;">ABC Unit</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 13%;">ABC Total</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 14%;">Unit Price</th>';
-                                        $html .= '<th class="px-2 py-2 text-right text-xs font-medium text-gray-500 dark:text-gray-300 uppercase" style="width: 18%;">Total</th>';
-                                        $html .= '</tr></thead>';
-                                        $html .= '<tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">';
-
-                                        foreach ($rfqResponse->quotes as $quote) {
-                                            if (!$quote->procurementItem) continue;
-                                            
-                                            $item = $quote->procurementItem;
-                                            $evaluation = AoqEvaluation::where('procurement_id', $record->id)
-                                                ->where('rfq_response_id', $rfqResponse->id)
-                                                ->where('requirement', 'quote_' . $item->id)
-                                                ->first();
-                                            $isLowest = $evaluation?->lowest_bid ?? false;
-
-                                            $html .= '<tr class="' . ($isLowest ? 'bg-green-50 dark:bg-green-900/20' : '') . '">';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->sort) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm align-top" style="word-wrap: break-word; word-break: break-word;">' . e($item->item_description) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->quantity) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-center align-top">' . e($item->unit) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right align-top">₱' . number_format($item->unit_cost, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right align-top">₱' . number_format($item->total_cost, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right font-semibold align-top">₱' . number_format($quote->unit_value, 2) . '</td>';
-                                            $html .= '<td class="px-2 py-3 text-sm text-right font-semibold align-top">₱' . number_format($quote->total_value, 2) . '</td>';
-                                            $html .= '</tr>';
-                                        }
-
-                                        $html .= '</tbody></table></div>';
-                                    } else {
-                                        $html .= '<p class="text-gray-500">No quotes submitted</p>';
-                                    }
-
-                                    $html .= '</div></details></div>';
-
                                     $totalQuoted = $rfqResponse->quotes->sum('total_value');
                                     $html .= '<div class="mt-4 text-right">';
                                     $html .= '<span class="text-lg font-bold">Total Quoted Amount: ₱' . number_format($totalQuoted, 2) . '</span>';
@@ -508,7 +586,8 @@ class ApproverViewAoq extends ViewRecord
                             })
                             ->visible(function ($record) {
                                 return !is_null($record->bid_opening_datetime) && 
-                                    Carbon::now()->greaterThanOrEqualTo($record->bid_opening_datetime);
+                                    Carbon::now()->greaterThanOrEqualTo($record->bid_opening_datetime) &&
+                                    $record->rfqResponses->isNotEmpty();
                             })
                             ->columnSpanFull(),
                     ]),
@@ -574,10 +653,10 @@ class ApproverViewAoq extends ViewRecord
                 ->first();
             if ($currentApproval) {
                 $hasPreviousPending = $this->record->approvals()
-                    ->where('module', 'abstract_of_quotation')
-                    ->where('sequence', '<', $currentApproval->sequence)
-                    ->where('status', 'Pending')
-                    ->exists();
+    ->where('sequence', '<', $currentApproval->sequence)
+    ->where('status', 'Pending')
+    ->exists();
+
                 $hasRejection = $this->record->approvals()
                     ->where('module', 'abstract_of_quotation')
                     ->where('status', 'Rejected')
@@ -598,164 +677,227 @@ class ApproverViewAoq extends ViewRecord
         // Add tie-breaking view action if record exists
         if ($hasTieBreakingRecord) {
             $actions[] = Action::make('viewTieBreaking')
-                ->label('View Tie-Breaking Details')
-                ->icon('heroicon-o-clipboard-document-check')
-                ->color('info')
-                ->modalContent(function () {
-                    $tieRecord = \DB::table('aoq_tie_breaking_records')
-                        ->where('procurement_id', $this->record->id)
-                        ->latest()
-                        ->first();
+            ->label('View Tie-Breaking Details')
+            ->icon('heroicon-o-clipboard-document-check')
+            ->color('info')
+            ->visible(function () use ($hasTieBreakingRecord) {
+                return $hasTieBreakingRecord;
+            })
+            ->modalContent(function () {
+                $records = \DB::table('aoq_tie_breaking_records')
+                    ->where('procurement_id', $this->record->id)
+                    ->orderByDesc('performed_at')
+                    ->get();
 
-                    if (!$tieRecord) {
-                        return view('filament.components.empty-state', [
-                            'message' => 'No tie-breaking record found.'
-                        ]);
-                    }
+                if ($records->isEmpty()) {
+                    return view('filament.components.empty-state', ['message' => 'No tie-breaking records.']);
+                }
 
-                    $tiedSuppliers = json_decode($tieRecord->tied_suppliers_data, true);
-
-                    return view('filament.components.tie-breaking-details', [
-                        'record' => $tieRecord,
-                        'suppliers' => $tiedSuppliers,
-                    ]);
-                })
-                ->modalWidth('3xl')
-                ->slideOver()
-                ->modalSubmitAction(false)
-                ->modalCancelAction(fn ($action) => $action
-                    ->label('Close')
-                    ->color('primary')
-                    ->icon('heroicon-o-x-mark')
-                    ->button()
+                return view('filament.components.tie-breaking-details-multiple', compact('records'));
+            })
+            ->modalWidth('3xl')
+            ->slideOver()
+            ->modalSubmitAction(false)
+            ->modalCancelAction(fn ($action) => $action
+                ->label('Close')
+                ->color('primary')
+                ->icon('heroicon-o-x-mark')
+                ->button()
                 );
         }
 
         // Approve & Reject buttons (only if user can act)
-        if ($canAct) {
-            $actions[] = Action::make('approve')
-                ->label('Approve')
-                ->icon('heroicon-o-check')
-                ->color('success')
-                ->requiresConfirmation()
-                ->modalHeading('Approve AOQ')
-                ->modalDescription('Are you sure you want to approve this Abstract of Quotation?')
-                ->action(function () use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+if ($canAct) {
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Approved',
-                            'action_at' => now(),
-                            'remarks' => null,
-                        ]);
+    /*
+    |--------------------------------------------------------------------------
+    | APPROVE AOQ
+    |--------------------------------------------------------------------------
+    */
+    $actions[] = Action::make('approve')
+        ->label('Approve')
+        ->icon('heroicon-o-check')
+        ->color('success')
+        ->requiresConfirmation()
+        ->modalHeading('Approve AOQ')
+        ->modalDescription('Are you sure you want to approve this Abstract of Quotation?')
+        ->action(function () use ($employeeId) {
 
-                        $allApproved = $this->record->approvals()
-                            ->where('module', 'abstract_of_quotation')
-                            ->where('status', 'Pending')
-                            ->doesntExist();
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
 
-                        if ($allApproved) {
-                            $this->record->update(['status' => 'Approved']);
-                        
-                        // AUTO-NOTIFY BIDDERS when AOQ is fully approved
-                            $this->notifyAllBidders();
-                        }
+            if (!$approval) {
+                return;
+            }
 
-                        ActivityLogger::log(
-                            'Approved Abstract of Quotation',
-                            'AOQ ' . $this->record->procurement_id . ' was approved by ' . Auth::user()->name
-                        );
+            // ✔ Update approval
+            $approval->update([
+                'status' => 'Approved',
+                'action_at' => now(),
+                'remarks' => null,
+            ]);
 
-                    // Send email notifications
-                    $procurement = $this->record;
-                    if (method_exists($procurement, 'participants')) {
-                        $participantIds = $procurement->participants()->pluck('employee_id');
-                    } else {
-                        $participantIds = collect();
+            // ✔ Check if AOQ is fully approved
+            $allApproved = $this->record->approvals()
+                ->where('module', 'abstract_of_quotation')
+                ->where('status', 'Pending')
+                ->doesntExist();
+
+            // ✔ Send status email for EVERY approval step
+$this->sendAoqStatusEmail('Approved');
+
+// ✔ If ALL approvers approved → mark AOQ Approved + notify bidders
+if ($allApproved) {
+    $this->record->update(['status' => 'Approved']);
+
+    // Notify bidders only after final approval
+    $this->notifyAllBidders();
+}
+
+
+
+            // ✔ Log action
+            ActivityLogger::log(
+                'Approved Abstract of Quotation',
+                'AOQ ' . $this->record->procurement_id . ' was approved by ' . Auth::user()->name
+            );
+
+            /*
+            |--------------------------------------------------------------------------
+            | NEXT APPROVER NOTIFICATION (NEW)
+            |--------------------------------------------------------------------------
+            */
+            $nextApproval = $this->record->approvals()
+                ->where('module', 'abstract_of_quotation')
+                ->where('sequence', '>', $approval->sequence)
+                ->where('status', 'Pending')
+                ->orderBy('sequence')
+                ->first();
+
+            if ($nextApproval && $nextApproval->employee?->user?->email) {
+                try {
+                    \Mail::to($nextApproval->employee->user->email)
+                        ->send(new \App\Mail\NextApproverNotificationMail(
+                            $this->record,
+                            $nextApproval->employee->full_name,
+                            $nextApproval->sequence
+                        ));
+                } catch (\Exception $e) {
+                    \Log::error("FAILED TO SEND NEXT AOQ APPROVER EMAIL: {$e->getMessage()}");
+                }
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | ORIGINAL AOQ STATUS EMAILS TO BIDDERS
+            |--------------------------------------------------------------------------
+            */
+            $procurement = $this->record;
+
+            $participantIds = method_exists($procurement, 'participants')
+                ? $procurement->participants()->pluck('employee_id')
+                : collect();
+
+            $employees = \App\Models\Employee::whereIn('id', $participantIds)->get();
+
+            foreach ($employees as $employee) {
+                if (!empty($employee->email)) {
+                    try {
+
+                        \Mail::to($employee->email)
+    ->send(new \App\Mail\AbstractOfQuotationStatusMail(
+        $procurement,
+        $employee,
+        'Approved',
+        null,
+        route('filament.admin.resources.procurements.view', $procurement->parent_id)
+    ));
+
+
+                    } catch (\Exception $e) {
+                        \Log::error("FAILED AOQ STATUS EMAIL: {$e->getMessage()}");
                     }
+                }
+            }
 
-                    $employees = \App\Models\Employee::whereIn('id', $participantIds)->get();
+            // ✔ Success message
+            Notification::make()
+                ->title('AOQ Approved')
+                ->body(
+                    'Abstract of Quotation has been approved.' .
+                    ($allApproved ? ' All bidders have been notified.' : '')
+                )
+                ->success()
+                ->send();
 
-                    foreach ($employees as $employee) {
-                        if (!empty($employee->email)) {
-                            try {
-                                \Mail::send('emails.aoq-status', [
-                                    'procurement' => $procurement,
-                                    'employee' => $employee,
-                                    'status' => 'Approved',
-                                    'link' => route('filament.admin.resources.procurements.view', $procurement->parent_id),
-                                ], function ($message) use ($employee, $procurement) {
-                                    $message->to($employee->email)
-                                        ->subject('AOQ Approved: ' . $procurement->title);
-                                });
-                            } catch (\Exception $e) {
-                                \Log::error("Failed to send AOQ approval email: {$e->getMessage()}");
-                            }
-                        }
-                    }
+            $this->record->refresh();
+        });
 
-                        Notification::make()
-                            ->title('AOQ Approved')
-                            ->body('The Abstract of Quotation has been approved successfully.' . 
-                                ($allApproved ? ' Bidders have been automatically notified.' : ''))
-                            ->success()
-                            ->send();
 
-                        $this->record->refresh();
-                    }
-                });
+    /*
+    |--------------------------------------------------------------------------
+    | REJECT AOQ
+    |--------------------------------------------------------------------------
+    */
+    $actions[] = Action::make('reject')
+        ->label('Reject')
+        ->icon('heroicon-o-x-mark')
+        ->color('danger')
+        ->requiresConfirmation()
+        ->modalHeading('Reject AOQ')
+        ->modalDescription('Please provide a reason for rejecting this Abstract of Quotation.')
+        ->form([
+            \Filament\Forms\Components\Textarea::make('remarks')
+                ->label('Remarks')
+                ->required()
+                ->maxLength(500)
+                ->rows(4)
+                ->placeholder('Enter the reason for rejection...'),
+        ])
+        ->action(function (array $data) use ($employeeId) {
 
-            $actions[] = Action::make('reject')
-                ->label('Reject')
-                ->icon('heroicon-o-x-mark')
-                ->color('danger')
-                ->requiresConfirmation()
-                ->modalHeading('Reject AOQ')
-                ->modalDescription('Please provide a reason for rejecting this Abstract of Quotation.')
-                ->form([
-                    \Filament\Forms\Components\Textarea::make('remarks')
-                        ->label('Remarks')
-                        ->required()
-                        ->maxLength(500)
-                        ->rows(4)
-                        ->placeholder('Enter the reason for rejection...'),
-                ])
-                ->action(function (array $data) use ($employeeId) {
-                    $approval = $this->record->approvals()
-                        ->where('employee_id', $employeeId)
-                        ->where('status', 'Pending')
-                        ->first();
+            $approval = $this->record->approvals()
+                ->where('employee_id', $employeeId)
+                ->where('status', 'Pending')
+                ->first();
 
-                    if ($approval) {
-                        $approval->update([
-                            'status' => 'Rejected',
-                            'action_at' => now(),
-                            'remarks' => $data['remarks'],
-                        ]);
+            if (!$approval) {
+                return;
+            }
 
-                        $this->record->update(['status' => 'Rejected']);
-                        $this->record->parent->update(['status' => 'Rejected']);
+            // ✔ Update approval as rejected
+            $approval->update([
+                'status' => 'Rejected',
+                'action_at' => now(),
+                'remarks' => $data['remarks'],
+            ]);
 
-                        ActivityLogger::log(
-                            'Rejected Abstract of Quotation',
-                            'AOQ ' . $this->record->procurement_id . ' was rejected by ' . Auth::user()->name .
-                            ' with remarks: ' . $data['remarks']
-                        );
+            // ✔ Reject AOQ & its parent
+            $this->record->update(['status' => 'Rejected']);
+            $this->record->parent()->update(['status' => 'Rejected']);
 
-                        Notification::make()
-                            ->title('AOQ Rejected')
-                            ->body('The Abstract of Quotation has been rejected.')
-                            ->danger()
-                            ->send();
+            // ✔ Log action
+            ActivityLogger::log(
+                'Rejected Abstract of Quotation',
+                'AOQ ' . $this->record->procurement_id . ' was rejected by ' . Auth::user()->name .
+                ' with remarks: ' . $data['remarks']
+            );
 
-                        $this->record->refresh();
-                    }
-                });
-        }
+            $this->sendAoqStatusEmail('Rejected', $data['remarks']);
+
+            // ✔ Notify user
+            Notification::make()
+                ->title('AOQ Rejected')
+                ->body('The Abstract of Quotation has been rejected.')
+                ->danger()
+                ->send();
+
+            $this->record->refresh();
+        });
+}
+
 
         // 3. View PDF — ALWAYS LAST
         $actions[] = Action::make('viewPdf')
@@ -845,4 +987,67 @@ foreach ($allEvaluationDetails as $evalDetails) {
 
     \Log::info("AOQ Auto-Notification: Sent {$notifiedCount} email(s) for procurement {$procurement->procurement_id}");
 }
+private function sendAoqStatusEmail(string $status, ?string $remarks = null): void
+{
+    $procurement = $this->record;  // AOQ
+    $approver = auth()->user();
+
+    // Get PR (root parent)
+    $pr = $procurement->parent;
+    if (! $pr) {
+        \Log::error("AOQ EMAIL: Parent PR not found for AOQ ID {$procurement->id}");
+        return;
+    }
+
+    // PR requester OR creator (fallback)
+    $creator = $pr->creator ?? $pr->requester ?? null;
+
+    // Build link
+    $link = url('/admin/procurements/' . $pr->id);
+
+    /*
+    |--------------------------------------------------------------------------
+    | 1. Send to PR Requester
+    |--------------------------------------------------------------------------
+    */
+    if ($creator && $creator->email) {
+        try {
+            \Mail::to($creator->email)->send(
+                new \App\Mail\AbstractOfQuotationStatusMail(
+                    $procurement,
+                    $creator,
+                    $status,
+                    $remarks,
+                    $link
+                )
+            );
+        } catch (\Exception $e) {
+            \Log::error("AOQ EMAIL FAILED (Requester): {$e->getMessage()}");
+        }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 2. Send to ALL PR employees
+    |--------------------------------------------------------------------------
+    */
+    foreach ($pr->employees as $employee) {
+        if ($employee->email) {
+            try {
+                \Mail::to($employee->email)->send(
+                    new \App\Mail\AbstractOfQuotationStatusMail(
+                        $procurement,
+                        $employee,
+                        $status,
+                        $remarks,
+                        $link
+                    )
+                );
+            } catch (\Exception $e) {
+                \Log::error("AOQ EMAIL FAILED (Employee {$employee->id}): {$e->getMessage()}");
+            }
+        }
+    }
+}
+
 }
